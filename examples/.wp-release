@@ -18,5 +18,6 @@ theme    wp-content/themes/my-theme
 dir      lp                                landing
 
 # 版の表記がそろっているかを確かめる追加のファイル(任意). 書式: check パス:その行を探す正規表現
-# 行の中に版番号があればよい. (確認の処理は開発中です)
+# 行の中に版番号があればよい(1.2.3 は 11.2.30 や 1.2.3-beta には一致しない).
+# そのパスを含む対象の Zip を作るときだけ確かめる.
 check    wp-content/plugins/my-plugin/package.json:"version"

@@ -25,6 +25,9 @@ CONFIG_NAME=".wp-release"
 EXIT_STOP=1
 EXIT_USAGE=2
 
+# 使う WP-CLI. 既定は PATH 上の wp. 複数の wp がある・テストで差し替えるときは環境変数で指す.
+WP_BIN="${WP_RELEASE_ZIP_MAKER_WP:-wp}"
+
 # --- 設定の読み込み結果(load_config が埋める) -------------------------------------------------
 # 対象(plugin / theme / dir)は、同じ添字の 3 本の配列で持つ.
 T_KIND=()  # plugin | theme | dir
@@ -35,6 +38,7 @@ C_PATH=()  # 設定ファイルからの相対パス
 C_REGEX=() # その行を探す正規表現
 CONFIG_FILE=""  # 見つけた設定ファイルの絶対パス
 CONFIG_DIR=""   # その置き場所(相対パスの基準)
+GIT_TOP=""      # Git のルート(シンボリックリンクを解いた絶対パス)
 CFG_TAG_FORMAT=""
 CFG_OUTPUT=""
 CFG_REQUIRES=""
@@ -121,6 +125,52 @@ valid_rel_path() {
 	return 0
 }
 
+# 相対パスの表記ゆれをそろえる(先頭の './' と末尾の '/' を取る. 空になったら '.'). valid_rel_path を通ったものだけ渡す.
+clean_rel_path() {
+	local p="$1"
+	while :; do
+		case "${p}" in
+			./*) p="${p#./}" ;;
+			*/) p="${p%/}" ;;
+			*) break ;;
+		esac
+	done
+	printf '%s' "${p:-.}"
+}
+
+# $1 のパスが、対象のディレクトリ $2 の下(または同じ)か. $2 が '.' なら、すべてが下にある.
+# どちらも設定ファイルからの相対パス(検証済みで、先頭の './' や末尾の '/' は無い前提).
+path_under() {
+	[ "$2" = "." ] && return 0
+	case "$1" in
+		"$2" | "$2"/*) return 0 ;;
+	esac
+	return 1
+}
+
+# 絶対パスを字面だけで整える('.' と '..' を畳む). 存在を問わず、シンボリックリンクも解かない.
+normalize_path() {
+	local IFS=/ seg result=""
+	set -f
+	for seg in $1; do
+		case "${seg}" in
+			'' | .) ;;
+			..) result="${result%/*}" ;;
+			*) result="${result}/${seg}" ;;
+		esac
+	done
+	set +f
+	printf '%s' "${result:-/}"
+}
+
+# 出力先の絶対パスを標準出力へ出す(設定ファイルからの相対パス・絶対パスのどちらも可).
+output_dir() {
+	case "${CFG_OUTPUT}" in
+		/*) normalize_path "${CFG_OUTPUT}" ;;
+		*) normalize_path "${CONFIG_DIR}/${CFG_OUTPUT}" ;;
+	esac
+}
+
 # --- 設定ファイル -------------------------------------------------------------------------------
 
 # 設定ファイルを探す. カレントから上へ、Git のルート(含む)まで. 見つけたら CONFIG_FILE / CONFIG_DIR を埋める.
@@ -130,6 +180,7 @@ find_config() {
 		die "Git リポジトリの中で実行してください(カレントは Git の管理下ではありません)."
 	# 比べやすいよう、シンボリックリンクを解いた絶対パスにそろえる.
 	top="$(cd "${top}" && pwd -P)"
+	GIT_TOP="${top}"
 	dir="$(pwd -P)"
 	while :; do
 		if [ -f "${dir}/${CONFIG_NAME}" ]; then
@@ -205,6 +256,7 @@ load_config() {
 				[ -z "${extra}" ] || die "${CONFIG_NAME}:${lineno}: ${kind} の行に余分な語があります('${extra}'). 書式は '${kind} <パス> [スラッグ]' です."
 				valid_rel_path "${path}" ||
 					die "${CONFIG_NAME}:${lineno}: パス '${path}' は、設定ファイルからの相対パスで、'..' を含まない形にしてください."
+				path="$(clean_rel_path "${path}")"
 				if [ -z "${slug}" ]; then
 					# スラッグ省略時はディレクトリ名. '.' はディレクトリ名が決まらないので省略できない.
 					[ "${path}" != "." ] ||
@@ -227,6 +279,7 @@ load_config() {
 				valid_rel_path "${path}" ||
 					die "${CONFIG_NAME}:${lineno}: check のパス '${path}' は、設定ファイルからの相対パスで、'..' を含まない形にしてください."
 				[ -n "${value}" ] || die "${CONFIG_NAME}:${lineno}: check の正規表現が空です."
+				path="$(clean_rel_path "${path}")"
 				C_PATH[${#C_PATH[@]}]="${path}"
 				C_REGEX[${#C_REGEX[@]}]="${value}"
 				;;
@@ -267,6 +320,24 @@ validate_config() {
 		esac
 	fi
 
+	# check 行は、どれかの対象のディレクトリの下になければならない(版の確認は対象ごとに行うため.
+	# どの対象にも属さない check は、書き間違いか、確認されないまま残る行になる).
+	i=0
+	while [ "${i}" -lt "${#C_PATH[@]}" ]; do
+		j=0
+		local owned=0
+		while [ "${j}" -lt "${n}" ]; do
+			if path_under "${C_PATH[${i}]}" "${T_PATH[${j}]}"; then
+				owned=1
+				break
+			fi
+			j=$((j + 1))
+		done
+		[ "${owned}" -eq 1 ] ||
+			die "${CONFIG_NAME}: check '${C_PATH[${i}]}' が、どの対象のディレクトリの下にもありません."
+		i=$((i + 1))
+	done
+
 	# スラッグの重複(Zip の名前・タグが衝突する).
 	i=0
 	while [ "${i}" -lt "${n}" ]; do
@@ -306,29 +377,44 @@ header_version() {
 	head -c "$2" "$1" | sed -n 's/^[[:space:]*#@]*Version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1
 }
 
-# 対象の版を読んで標準出力へ出す. 読めなければ何も出さず 1 を返す.
+# 版を読むファイルの絶対パスを標準出力へ出す. 見つからなければ何も出さず 1 を返す.
 #   $1 = 種類 / $2 = 対象のディレクトリ(絶対パス)
-read_version() {
-	local kind="$1" dir="$2" v="" f
+version_file() {
+	local kind="$1" dir="$2" f
 	case "${kind}" in
 		theme)
-			[ -f "${dir}/style.css" ] && v="$(header_version "${dir}/style.css" 5000)"
+			[ -f "${dir}/style.css" ] || return 1
+			printf '%s' "${dir}/style.css"
 			;;
 		plugin)
 			# WordPress は Plugin Name: を先頭 8KB から探す. 同じ階層の php を名前順に見て、最初に見つかったものを使う.
 			for f in "${dir}"/*.php; do
 				[ -f "${f}" ] || continue
 				if head -c 8192 "${f}" | grep -q '^[[:space:]*#@]*Plugin Name:'; then
-					v="$(header_version "${f}" 8192)"
-					break
+					printf '%s' "${f}"
+					return 0
 				fi
 			done
+			return 1
 			;;
 		dir)
-			if [ -f "${dir}/VERSION" ]; then
-				IFS= read -r v <"${dir}/VERSION" || true
-				v="$(trim "${v}")"
-			fi
+			[ -f "${dir}/VERSION" ] || return 1
+			printf '%s' "${dir}/VERSION"
+			;;
+	esac
+}
+
+# 対象の版を読んで標準出力へ出す. 読めなければ何も出さず 1 を返す.
+#   $1 = 種類 / $2 = 対象のディレクトリ(絶対パス)
+read_version() {
+	local kind="$1" dir="$2" v="" f
+	f="$(version_file "${kind}" "${dir}")" || return 1
+	case "${kind}" in
+		theme) v="$(header_version "${f}" 5000)" ;;
+		plugin) v="$(header_version "${f}" 8192)" ;;
+		dir)
+			IFS= read -r v <"${f}" || true
+			v="$(trim "${v}")"
 			;;
 	esac
 	[ -n "${v}" ] || return 1
@@ -354,15 +440,10 @@ tag_exists() {
 cmd_list() {
 	load_config
 
-	local n="${#T_KIND[@]}" i abs ver tag tagged out
+	local n="${#T_KIND[@]}" i abs ver tag tagged
 	printf '設定:       %s\n' "${CONFIG_FILE}"
 	printf 'タグの形式: %s\n' "${CFG_TAG_FORMAT}"
-	# output は設定ファイルからの相対パス(絶対パスならそのまま).
-	case "${CFG_OUTPUT}" in
-		/*) out="${CFG_OUTPUT}" ;;
-		*) out="${CONFIG_DIR}/${CFG_OUTPUT}" ;;
-	esac
-	printf '出力先:     %s\n' "${out}"
+	printf '出力先:     %s\n' "$(output_dir)"
 	printf '\n'
 	# 列の見出しは、日本語だと桁がそろわないので英字にする.
 	printf '%-7s %-28s %-10s %-34s %-6s %s\n' KIND SLUG VERSION TAG TAGGED PATH
@@ -386,6 +467,217 @@ cmd_list() {
 		fi
 		i=$((i + 1))
 	done
+}
+
+# --- 事前の確認(Zip を作る前に、止めるべき状態をすべて確かめる) -----------------------------
+
+# 見つけた対象の添字. find_target が埋める.
+TI=-1
+# check の確認の結果. check_version_files が埋める(確認した行の数・食い違った数).
+CHECK_TOTAL=0
+CHECK_BAD=0
+
+# 設定からスラッグの対象を探して TI に入れる. 無ければ、設定にあるスラッグを挙げて止める.
+find_target() {
+	local slug="$1" i=0 known=""
+	while [ "${i}" -lt "${#T_SLUG[@]}" ]; do
+		if [ "${T_SLUG[${i}]}" = "${slug}" ]; then
+			TI="${i}"
+			return 0
+		fi
+		known="${known} ${T_SLUG[${i}]}"
+		i=$((i + 1))
+	done
+	die "スラッグ '${slug}' は ${CONFIG_NAME} にありません. 設定にあるスラッグ:${known}"
+}
+
+# Zip の作成に要る道具(zip コマンド・WP-CLI・wp dist-archive)があるかを確かめる. 無ければ入れ方を示して止める.
+check_tools() {
+	command -v zip >/dev/null 2>&1 ||
+		die "zip コマンドが見つかりません. wp dist-archive が Zip を作るときに使います(macOS は標準. Linux は zip パッケージを入れてください)."
+	command -v "${WP_BIN}" >/dev/null 2>&1 ||
+		die "WP-CLI(${WP_BIN})が見つかりません. 入れ方: https://wp-cli.org/ (macOS の Homebrew: brew install wp-cli)"
+	# 登録されたコマンドなら --help は 0 で終わり、未登録なら 1 で終わる(WP-CLI 2.12.0 で確認).
+	# Mac の PHP 8.4 + WP-CLI 2.12.0 は Composer の Deprecated 警告を大量に出すので、出力は捨てる.
+	"${WP_BIN}" dist-archive --help >/dev/null 2>&1 ||
+		die "wp dist-archive が入っていません. 入れ方:
+  wp package install wp-cli/dist-archive-command:3.1.0   # WP-CLI 2.12.x
+  wp package install wp-cli/dist-archive-command         # WP-CLI 2.13 以上
+版の指定なしは、WP-CLI 2.12.x では失敗します(最新版が WP-CLI 2.13 以上を要求するため)."
+}
+
+# 対象のディレクトリの中の相対パスを作る. $1 = 対象のパス(設定ファイルからの相対) / $2 = その中の名前.
+rel_join() {
+	if [ "$1" = "." ]; then
+		printf '%s' "$2"
+	else
+		printf '%s/%s' "$1" "$2"
+	fi
+}
+
+# Git が追跡しているファイルか(設定ファイルのある場所からの相対パス).
+is_tracked() {
+	git -C "${CONFIG_DIR}" ls-files --error-unmatch -- "$1" >/dev/null 2>&1
+}
+
+# 作業ツリーがきれいか(未コミット・未追跡の変更が無いか). Zip は HEAD から作るので、汚れていれば止める.
+check_clean_tree() {
+	local status count
+	status="$(git -C "${CONFIG_DIR}" status --porcelain)" || die "git status に失敗しました."
+	[ -z "${status}" ] && return 0
+	count="$(printf '%s\n' "${status}" | wc -l)"
+	err "${PROG}: 作業ツリーに未コミット・未追跡の変更があります(Zip は HEAD から作るので、コミットしてから実行してください):"
+	printf '%s\n' "${status}" | head -n 10 | sed 's/^/  /' >&2
+	if [ "$((count))" -gt 10 ]; then
+		err "  ...(ほかに $((count - 10)) 件)"
+	fi
+	exit "${EXIT_STOP}"
+}
+
+# 版の文字列がタグ名・ファイル名に使えるか(英数字で始まり、英数字・ドット・ハイフン・アンダースコア・プラスだけ).
+valid_version() {
+	case "$1" in
+		'' | [!0-9A-Za-z]* | *[!0-9A-Za-z._+-]*) return 1 ;;
+	esac
+	return 0
+}
+
+# 対象 $1 に属する check 行のファイルを開き、版 $2 が書かれているかを確かめる(全部確かめてから結果を返す).
+# 食い違いは標準エラーに出す. 結果は CHECK_TOTAL / CHECK_BAD に入れる.
+# 行の中に版番号があればよい. 版の前後は、英数字・ドット・ハイフン・アンダースコア・プラス以外であること
+# (1.2.3 が 11.2.30 や 1.2.3-beta に当たらないように).
+check_version_files() {
+	local idx="$1" ver="$2" i=0 f re lines rc pat shown
+	CHECK_TOTAL=0
+	CHECK_BAD=0
+	pat="(^|[^0-9A-Za-z._+-])$(printf '%s' "${ver}" | sed 's/[.+]/\\&/g')([^0-9A-Za-z._+-]|\$)"
+	while [ "${i}" -lt "${#C_PATH[@]}" ]; do
+		if path_under "${C_PATH[${i}]}" "${T_PATH[${idx}]}"; then
+			CHECK_TOTAL=$((CHECK_TOTAL + 1))
+			f="${CONFIG_DIR}/${C_PATH[${i}]}"
+			re="${C_REGEX[${i}]}"
+			if [ ! -f "${f}" ]; then
+				err "  ${C_PATH[${i}]}: ファイルがありません"
+				CHECK_BAD=$((CHECK_BAD + 1))
+			else
+				# grep の終了コード: 0 = 一致あり / 1 = 一致なし / 2 = 正規表現の誤りなど.
+				lines="$(grep -E -- "${re}" "${f}" 2>/dev/null)"
+				rc=$?
+				if [ "${rc}" -ge 2 ]; then
+					err "  ${C_PATH[${i}]}: 正規表現 '${re}' が不正です"
+					CHECK_BAD=$((CHECK_BAD + 1))
+				elif [ "${rc}" -eq 1 ]; then
+					err "  ${C_PATH[${i}]}: 正規表現 '${re}' に一致する行がありません"
+					CHECK_BAD=$((CHECK_BAD + 1))
+				elif ! printf '%s\n' "${lines}" | grep -Eq -- "${pat}"; then
+					shown="$(printf '%s\n' "${lines}" | head -n 3 | sed 's/^[[:space:]]*/      /')"
+					err "  ${C_PATH[${i}]}: 版 ${ver} が書かれていません. 一致した行(最大 3 行):"
+					err "${shown}"
+					CHECK_BAD=$((CHECK_BAD + 1))
+				fi
+			fi
+		fi
+		i=$((i + 1))
+	done
+}
+
+# 「build」と「--dry-run」の事前の確認. すべて通れば、--dry-run は要約を出して終わる.
+# 組み合わせ表(プラン)の「通常」の列の「止める」を、この順に確かめる:
+#   道具 → コミットの有無 → 対象と .distignore → 作業ツリー → 版と check → タグ → 出力先の Zip
+cmd_build() {
+	local slug="$1" mode="$2"
+	local kind path abs ver vfile vrel tag out zip_file branch tagged_zip
+
+	load_config
+	find_target "${slug}"
+	kind="${T_KIND[${TI}]}"
+	path="${T_PATH[${TI}]}"
+	abs="${CONFIG_DIR}/${path}"
+
+	check_tools
+
+	git -C "${CONFIG_DIR}" rev-parse -q --verify HEAD >/dev/null 2>&1 ||
+		die "このリポジトリにはコミットがまだありません(Zip は HEAD から作ります)."
+
+	# 対象のディレクトリと .distignore. dist-archive は .distignore が無いと全ファイルを入れてしまうので、ここで止める.
+	[ -d "${abs}" ] || die "対象のディレクトリ '${path}' がありません."
+	is_tracked "$(rel_join "${path}" .distignore)" ||
+		die "'${path}' に、コミット済みの .distignore がありません.
+  wp dist-archive は .distignore が無いと、node_modules・src・設定ファイルを含む全ファイルを Zip に入れます.
+  Zip に入れないものを書いた .distignore を作り、コミットしてください."
+
+	check_clean_tree
+
+	# 版. 読むファイルが Git に入っていること(Zip に入るファイルから版を読むため).
+	vfile="$(version_file "${kind}" "${abs}")" ||
+		die "'${path}' の版を読むファイルがありません(${kind}: $(version_source "${kind}"))."
+	ver="$(read_version "${kind}" "${abs}")" ||
+		die "${vfile#"${CONFIG_DIR}"/} から版を読めません(${kind}: $(version_source "${kind}"))."
+	valid_version "${ver}" ||
+		die "版 '${ver}' は、タグ名とファイル名に使えない形です(英数字で始まり、英数字・. _ + - だけ)."
+	vrel="${vfile#"${CONFIG_DIR}"/}"
+	is_tracked "${vrel}" || die "版を読むファイル '${vrel}' が Git に入っていません(.gitignore に入っていませんか)."
+
+	# check: 版の表記がそろっているか. 食い違いはすべて表示してから止める.
+	check_version_files "${TI}" "${ver}"
+	if [ "${CHECK_BAD}" -gt 0 ]; then
+		err "${PROG}: 版の表記がそろっていません(${vrel} の版 = ${ver} / 食い違い ${CHECK_BAD} 件 / 確認 ${CHECK_TOTAL} 件)."
+		exit "${EXIT_STOP}"
+	fi
+
+	# タグと出力先の Zip. 組み合わせ表の「タグ」「出力先の Zip」の列.
+	tag="$(make_tag "${slug}" "${ver}")"
+	git check-ref-format "refs/tags/${tag}" ||
+		die "タグ名 '${tag}' は Git のタグ名として使えません(tag_format を見直してください)."
+	out="$(output_dir)"
+	zip_file="${out}/${slug}.${ver}.zip"
+	tagged_zip="no"
+	[ -e "${zip_file}" ] && tagged_zip="yes"
+	if tag_exists "${tag}"; then
+		if [ "${tagged_zip}" = "yes" ]; then
+			die "タグ ${tag} も Zip もすでにあります(${zip_file}). 新しい版を作るなら版を上げてください. 同じ版を作り直すなら、Zip を消してから --rebuild を使ってください."
+		fi
+		die "タグ ${tag} はすでにあります. 新しい版を作るなら版を上げてください. 同じ版の Zip を作り直すなら --rebuild を使ってください."
+	fi
+	if [ "${tagged_zip}" = "yes" ]; then
+		die "タグ ${tag} は無いのに、Zip がすでにあります(${zip_file}). 前回の作りかけか、別の作業の Zip です. 確かめて消してから実行してください."
+	fi
+
+	# 出力先が Git の中で、無視もされていなければ、作った Zip が次回の作業ツリーを汚す(警告だけ).
+	case "${out}/" in
+		"${GIT_TOP}"/*)
+			if ! git -C "${CONFIG_DIR}" check-ignore -q -- "${zip_file}" 2>/dev/null; then
+				err "警告: 出力先 ${out} は Git のリポジトリの中で、.gitignore にも入っていません. 作った Zip が未追跡ファイルになり、次回は作業ツリーが汚れて止まります. Git の外を指すことを勧めます."
+			fi
+			;;
+	esac
+
+	branch="$(git -C "${CONFIG_DIR}" branch --show-current)"
+	case "${branch}" in
+		main | master) ;;
+		'') err "警告: HEAD がブランチにありません(detached HEAD). 意図したコミットか確かめてください." ; branch="(detached HEAD)" ;;
+		*) err "警告: ブランチは ${branch} です(main / master ではありません). リリースのタグを打つコミットか確かめてください." ;;
+	esac
+
+	if [ "${mode}" = "dry-run" ]; then
+		printf '[dry-run] Zip もタグも作りません. 事前の確認はすべて通りました.\n\n'
+		printf '対象:       %s (%s)\n' "${slug}" "${kind}"
+		printf 'パス:       %s\n' "${path}"
+		printf '版:         %s (%s)\n' "${ver}" "${vrel}"
+		if [ "${CHECK_TOTAL}" -eq 0 ]; then
+			printf 'check:      なし(この対象に check の行はありません)\n'
+		else
+			printf 'check:      %s 件とも一致\n' "${CHECK_TOTAL}"
+		fi
+		printf 'ブランチ:   %s\n' "${branch}"
+		printf 'タグ:       %s (まだありません)\n' "${tag}"
+		printf 'Zip:        %s\n' "${zip_file}"
+		printf '\n実行すると、HEAD の内容から Zip を作り、注釈付きタグを打ちます(push はしません).\n'
+		return 0
+	fi
+
+	# 事前の確認は通ったが、Zip の作成はまだ実装していない(Step 4).
+	not_implemented "Zip の作成(事前の確認は通りました: ${tag})"
 }
 
 # --- 入口 ---------------------------------------------------------------------------------------
@@ -456,7 +748,10 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	not_implemented "${mode} ${slug}"
+	case "${mode}" in
+		build | dry-run) cmd_build "${slug}" "${mode}" ;;
+		rebuild) not_implemented "--rebuild(Step 5 で実装します)" ;;
+	esac
 }
 
 main "$@"
