@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+#
+# wp-release-zip-maker
+#
+# テーマ・プラグイン・WordPress の外のディレクトリの配布用 Zip を、ローカルで・版を管理しながら作る.
+# Zip の作成は WP-CLI の `wp dist-archive` に任せ、このツールは git と版の管理を担う薄いラッパー.
+#
+# 動作環境: macOS 標準の bash 3.2 でも動く書き方にする(連想配列・mapfile・${var,,} などを使わない).
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -u
+
+# ツール自身の版. リリースのタグ(素の版番号)・CHANGELOG・README と必ずそろえる.
+WP_RELEASE_ZIP_MAKER_VERSION="0.1.0"
+
+# 自分の名前(--help などの表示用). シンボリックリンク経由で呼ばれても同じ名前を出す.
+PROG="wp-release-zip-maker"
+
+# 終了コード: 0 = 成功 / 2 = 使い方の誤り・未実装.
+# 1 = 事前の確認などで止めた(利用者が直せるもの)は、Step 3 で EXIT_STOP として足す.
+EXIT_USAGE=2
+
+# 標準エラーへメッセージを出す.
+err() {
+	printf '%s\n' "$*" >&2
+}
+
+# 使い方を標準出力へ出す(--help). 仕様の正は README.md.
+usage() {
+	cat <<EOF
+${PROG} ${WP_RELEASE_ZIP_MAKER_VERSION}
+
+配布用 Zip を作り、版のタグを打つ(push はしない).
+Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
+
+使い方:
+  ${PROG} <slug>             Zip を作り、タグを打つ
+  ${PROG} <slug> --dry-run   確認だけ(Zip もタグも作らない)
+  ${PROG} <slug> --rebuild   既存のタグから Zip を作り直す(タグは打たない)
+  ${PROG} --list             設定にある対象と、今の版・タグの有無を一覧にする
+  ${PROG} --version          ツールの版を表示する
+  ${PROG} --help             この説明を表示する
+
+設定ファイル .wp-release は、カレントディレクトリから上へ探す(Git のルートで止める).
+詳しくは README.md を参照.
+EOF
+}
+
+# --version の出力.
+print_version() {
+	printf '%s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
+}
+
+# まだ実装していない機能が呼ばれたときの案内. 骨組み(Step 1)の間だけ使う.
+not_implemented() {
+	err "${PROG}: '$1' はまだ実装していません(開発中: ${WP_RELEASE_ZIP_MAKER_VERSION})."
+	exit "${EXIT_USAGE}"
+}
+
+main() {
+	# 引数なしは使い方の誤り. 説明を標準エラーに出して終了する.
+	if [ "$#" -eq 0 ]; then
+		usage >&2
+		exit "${EXIT_USAGE}"
+	fi
+
+	# 先に --help / --version だけを拾う(他の引数と並んでいても、これらが優先).
+	local arg
+	for arg in "$@"; do
+		case "${arg}" in
+			-h | --help)
+				usage
+				exit 0
+				;;
+			--version)
+				print_version
+				exit 0
+				;;
+		esac
+	done
+
+	# 残りの引数を解釈する. Step 2 以降で中身を実装する.
+	local slug="" mode="build"
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--list)
+				mode="list"
+				;;
+			--dry-run)
+				mode="dry-run"
+				;;
+			--rebuild)
+				mode="rebuild"
+				;;
+			-*)
+				err "${PROG}: 不明なオプション '$1'"
+				err "'${PROG} --help' で使い方を確認してください."
+				exit "${EXIT_USAGE}"
+				;;
+			*)
+				if [ -n "${slug}" ]; then
+					err "${PROG}: スラッグは 1 つだけ指定してください('${slug}' と '$1')."
+					exit "${EXIT_USAGE}"
+				fi
+				slug="$1"
+				;;
+		esac
+		shift
+	done
+
+	# --list はスラッグを取らない. それ以外はスラッグが要る.
+	if [ "${mode}" = "list" ]; then
+		not_implemented "--list"
+	fi
+	if [ -z "${slug}" ]; then
+		err "${PROG}: スラッグを指定してください."
+		err "'${PROG} --help' で使い方を確認してください."
+		exit "${EXIT_USAGE}"
+	fi
+
+	not_implemented "${mode} ${slug}"
+}
+
+main "$@"
