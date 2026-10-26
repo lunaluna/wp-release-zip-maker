@@ -581,6 +581,142 @@ check_version_files() {
 	done
 }
 
+# --- Zip の作成 ---------------------------------------------------------------------------------
+
+# 一時ディレクトリ(make_zip が作る). 終了時に必ず消す.
+TMP_WORK=""
+
+# 一時ディレクトリを消す(trap から呼ぶ). 作っていなければ何もしない.
+cleanup_tmp() {
+	if [ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ]; then
+		rm -rf -- "${TMP_WORK}"
+	fi
+}
+
+# ファイルの SHA-256 を標準出力へ出す(macOS は shasum・Linux は sha256sum・どちらも無ければ openssl).
+sha256_of() {
+	if command -v shasum >/dev/null 2>&1; then
+		shasum -a 256 "$1" | awk '{print $1}'
+	elif command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		openssl dgst -sha256 -r "$1" | awk '{print $1}'
+	fi
+}
+
+# バイト数を読みやすい単位にして標準出力へ出す.
+human_size() {
+	awk -v b="$1" 'BEGIN {
+		if (b >= 1048576) printf "%.2f MB", b / 1048576;
+		else if (b >= 1024) printf "%.1f KB", b / 1024;
+		else printf "%d B", b;
+	}'
+}
+
+# Git の ref($3)の時点の対象ディレクトリから Zip を作る. 作業ツリーは使わない(未追跡・無視されたファイルは入らない).
+#   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(HEAD またはタグ名) / $4 = 出力する Zip のパス
+# 手順: git archive で一時ディレクトリ/<スラッグ>/ へ展開 → wp dist-archive(.distignore を適用して zip) → 中身の確認.
+# 一時ディレクトリの名前を実パスにするのは、シンボリックリンクを含むと dist-archive が別の経路(コピー)に入るため.
+# 一時ディレクトリの下をスラッグと同じ名前にするのは、Zip の一番上のフォルダー名をスラッグにするため.
+make_zip() {
+	local slug="$1" path="$2" ref="$3" zip_file="$4"
+	local prefix tree_path dest st wp_out wp_rc
+
+	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う).
+	prefix="$(git -C "${CONFIG_DIR}" rev-parse --show-prefix)" || die "Git のルートからの位置を取得できません."
+	if [ "${path}" = "." ]; then
+		tree_path="${prefix%/}"
+	else
+		tree_path="${prefix}${path}"
+	fi
+
+	TMP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/wp-release-zip-maker.XXXXXX")" || die "一時ディレクトリを作れません."
+	TMP_WORK="$(cd "${TMP_WORK}" && pwd -P)"
+	trap cleanup_tmp EXIT
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
+	dest="${TMP_WORK}/${slug}"
+	mkdir "${dest}"
+
+	# git archive は、.gitattributes の export-ignore を効かせる(それに合うファイルは .distignore に書かなくても入らない).
+	# Git のルートで実行する: サブディレクトリで実行すると、その階層より下だけに絞られ、<ref>:<パス> が空になるため
+	# (設定ファイルが Git のルートの下の app/public などにある構成で実際に起きた).
+	git -C "${GIT_TOP}" archive --format=tar "${ref}:${tree_path}" | tar -x -C "${dest}"
+	st=("${PIPESTATUS[@]}")
+	[ "${st[0]}" -eq 0 ] || die "git archive に失敗しました(${ref}:${tree_path})."
+	[ "${st[1]}" -eq 0 ] || die "tar での展開に失敗しました."
+	[ -n "$(ls -A "${dest}")" ] || die "${ref} の '${path}' にファイルがありません."
+
+	# stdin を閉じるのは、万一 dist-archive が確認を求めても、待たずに落ちるようにするため.
+	# 出力は、Mac の PHP 8.4 + WP-CLI 2.12.0 が出す Composer の Deprecated 警告を除いて表示する.
+	wp_out="$("${WP_BIN}" dist-archive "${dest}" "${zip_file}" --plugin-dirname="${slug}" --create-target-dir 2>&1 </dev/null)"
+	wp_rc=$?
+	wp_out="$(printf '%s\n' "${wp_out}" | grep -v -i '^\(PHP \)\{0,1\}Deprecated:' | grep -v '^$')"
+	if [ "${wp_rc}" -ne 0 ] || [ ! -f "${zip_file}" ]; then
+		# 作りかけの Zip を残さない(残ると、次回「タグの無い Zip」として止まる).
+		[ -f "${zip_file}" ] && rm -f -- "${zip_file}"
+		die "wp dist-archive に失敗しました(終了コード ${wp_rc}):
+${wp_out}"
+	fi
+
+	verify_zip "${slug}" "${zip_file}"
+	warn_non_ascii_names "${dest}"
+}
+
+# Zip に入るファイル名に ASCII 以外(日本語など)があれば警告する(止めはしない).
+# macOS・Linux の zip は、UTF-8 の名前に「UTF-8 の名前」のフラグを付けない(2026-10-26 に macOS の zip で確認: Python の zipfile は cp437 と読んだ).
+# 展開する環境(Windows の標準機能など)によっては文字化けする. WordPress のテーマ・プラグインでは避けるのが無難.
+# 判定は、表示が崩れる unzip の出力ではなく、展開した一時ディレクトリ(.distignore の適用前)で行う.
+#   $1 = 展開した一時ディレクトリ
+warn_non_ascii_names() {
+	local n
+	# LC_ALL=C のとき [:print:] は ASCII の印字可能文字(空白を含む)だけ. その外 = ASCII 以外のバイトを含む名前.
+	n="$(LC_ALL=C find "$1" -name '*[![:print:]]*' 2>/dev/null | wc -l)"
+	n=$((n))
+	if [ "${n}" -gt 0 ]; then
+		err "警告: ASCII 以外の文字を含むファイル名が ${n} 個あります(.distignore で除いたものも数えています). Zip にエンコーディングの印が付かないため、展開する環境によっては文字化けします. WordPress のテーマ・プラグインでは、ファイル名を英数字にするのが無難です."
+	fi
+}
+
+# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること. unzip が無ければ確認を省く.
+#   $1 = スラッグ / $2 = Zip のパス
+verify_zip() {
+	local slug="$1" zip_file="$2"
+	if ! command -v unzip >/dev/null 2>&1; then
+		err "警告: unzip が無いので、Zip の中身の確認を省きました."
+		return 0
+	fi
+	# スラッグに正規表現の記号(ドット)があっても安全なよう、awk の index() で前方一致を見る.
+	# LC_ALL=C: ファイル名に ASCII 以外が入ると、ロケールによっては awk・sort が不正なバイト列で落ちるため.
+	if ! unzip -Z1 "${zip_file}" | LC_ALL=C awk -v s="${slug}/" 'index($0, s) != 1 { bad = 1 } END { exit bad ? 1 : 0 }'; then
+		rm -f -- "${zip_file}"
+		die "Zip の中に、${slug}/ の外のファイルがあります(Zip は消しました). dist-archive の動作が想定と違います."
+	fi
+	# 設定ファイルが対象の中にある構成(プラグイン 1 つ型)で、.distignore に書き忘れると、Zip に入って配布される.
+	if unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/${CONFIG_NAME}"; then
+		err "警告: Zip に ${slug}/${CONFIG_NAME}(このツールの設定)が入っています. 配布するものではないので、.distignore に ${CONFIG_NAME} を足してください."
+	fi
+}
+
+# 作った Zip の要約を出す(ファイル数・サイズ・SHA-256・一番上のフォルダーの直下の内訳).
+#   $1 = スラッグ / $2 = Zip のパス
+print_zip_summary() {
+	local slug="$1" zip_file="$2" bytes
+	bytes="$(wc -c <"${zip_file}")"
+	bytes=$((bytes))
+	printf 'Zip:        %s\n' "${zip_file}"
+	printf 'サイズ:     %s (%s バイト)\n' "$(human_size "${bytes}")" "${bytes}"
+	printf 'SHA-256:    %s\n' "$(sha256_of "${zip_file}")"
+	if command -v unzip >/dev/null 2>&1; then
+		printf '中身:       %s\n' "$(unzip -Zt "${zip_file}" | sed 's/^[[:space:]]*//')"
+		printf '\n%s/ の直下(ファイル数 名前):\n' "${slug}"
+		# 一番上のフォルダーの直下の名前ごとに、ファイル数を数える(末尾が '/' のディレクトリのエントリは数えない).
+		# LC_ALL=C: ASCII 以外のファイル名でも落ちないように. macOS の unzip は、ASCII 以外のバイトの一部を '?' に置き換え、
+		# 残りは不正な UTF-8 のまま出す. 端末を崩さないよう、印字できないバイトを '?' にそろえてから数える.
+		unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '$0 !~ /\/$/ && NF >= 2 && $2 != "" { c[$2]++ } END { for (k in c) printf "  %5d  %s\n", c[k], k }' | LC_ALL=C sort -k2 | head -n 40
+	fi
+}
+
 # 「build」と「--dry-run」の事前の確認. すべて通れば、--dry-run は要約を出して終わる.
 # 組み合わせ表(プラン)の「通常」の列の「止める」を、この順に確かめる:
 #   道具 → コミットの有無 → 対象と .distignore → 作業ツリー → 版と check → タグ → 出力先の Zip
@@ -672,12 +808,16 @@ cmd_build() {
 		printf 'ブランチ:   %s\n' "${branch}"
 		printf 'タグ:       %s (まだありません)\n' "${tag}"
 		printf 'Zip:        %s\n' "${zip_file}"
-		printf '\n実行すると、HEAD の内容から Zip を作り、注釈付きタグを打ちます(push はしません).\n'
+		printf '\n実行すると、HEAD の内容から Zip を作ります.\n'
 		return 0
 	fi
 
-	# 事前の確認は通ったが、Zip の作成はまだ実装していない(Step 4).
-	not_implemented "Zip の作成(事前の確認は通りました: ${tag})"
+	# Zip を作る(HEAD の時点の内容から). タグ付けはまだ実装していない(Step 5).
+	printf '%s (%s) を作ります: 版 %s・HEAD %s\n' "${slug}" "${kind}" "${ver}" "$(git -C "${CONFIG_DIR}" rev-parse --short HEAD)"
+	make_zip "${slug}" "${path}" HEAD "${zip_file}"
+	printf '\n'
+	print_zip_summary "${slug}" "${zip_file}"
+	printf '\n注意: タグ %s はまだ打っていません(開発中: タグ付けは Step 5 で実装します). 作り直すなら Zip を消してから実行してください.\n' "${tag}"
 }
 
 # --- 入口 ---------------------------------------------------------------------------------------
