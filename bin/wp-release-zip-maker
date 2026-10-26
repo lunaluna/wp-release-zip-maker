@@ -6,6 +6,7 @@
 # Zip の作成は WP-CLI の `wp dist-archive` に任せ、このツールは git と版の管理を担う薄いラッパー.
 #
 # 動作環境: macOS 標準の bash 3.2 でも動く書き方にする(連想配列・mapfile・${var,,} などを使わない).
+# bash 3.2 では、空の配列を "${arr[@]}" と展開すると set -u で落ちる. 配列は添字のループで読む.
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -17,13 +18,38 @@ WP_RELEASE_ZIP_MAKER_VERSION="0.1.0"
 # 自分の名前(--help などの表示用). シンボリックリンク経由で呼ばれても同じ名前を出す.
 PROG="wp-release-zip-maker"
 
-# 終了コード: 0 = 成功 / 2 = 使い方の誤り・未実装.
-# 1 = 事前の確認などで止めた(利用者が直せるもの)は、Step 3 で EXIT_STOP として足す.
+# 設定ファイルの名前.
+CONFIG_NAME=".wp-release"
+
+# 終了コード: 0 = 成功 / 1 = 事前の確認などで止めた(利用者が直せるもの) / 2 = 使い方の誤り・未実装.
+EXIT_STOP=1
 EXIT_USAGE=2
+
+# --- 設定の読み込み結果(load_config が埋める) -------------------------------------------------
+# 対象(plugin / theme / dir)は、同じ添字の 3 本の配列で持つ.
+T_KIND=()  # plugin | theme | dir
+T_PATH=()  # 設定ファイルからの相対パス
+T_SLUG=()  # スラッグ(Zip の一番上のフォルダー名・タグ名に使う)
+# check 行は、同じ添字の 2 本の配列で持つ.
+C_PATH=()  # 設定ファイルからの相対パス
+C_REGEX=() # その行を探す正規表現
+CONFIG_FILE=""  # 見つけた設定ファイルの絶対パス
+CONFIG_DIR=""   # その置き場所(相対パスの基準)
+CFG_TAG_FORMAT=""
+CFG_OUTPUT=""
+CFG_REQUIRES=""
+
+# --- 表示まわり ---------------------------------------------------------------------------------
 
 # 標準エラーへメッセージを出す.
 err() {
 	printf '%s\n' "$*" >&2
+}
+
+# 利用者が直せる理由で止めるとき. メッセージを出して終了コード 1 で終わる.
+die() {
+	err "${PROG}: $*"
+	exit "${EXIT_STOP}"
 }
 
 # 使い方を標準出力へ出す(--help). 仕様の正は README.md.
@@ -42,7 +68,7 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
   ${PROG} --version          ツールの版を表示する
   ${PROG} --help             この説明を表示する
 
-設定ファイル .wp-release は、カレントディレクトリから上へ探す(Git のルートで止める).
+設定ファイル ${CONFIG_NAME} は、カレントディレクトリから上へ探す(Git のルートで止める).
 詳しくは README.md を参照.
 EOF
 }
@@ -52,11 +78,317 @@ print_version() {
 	printf '%s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
 }
 
-# まだ実装していない機能が呼ばれたときの案内. 骨組み(Step 1)の間だけ使う.
+# まだ実装していない機能が呼ばれたときの案内. 実装が済んだ機能から順に使わなくなる.
 not_implemented() {
 	err "${PROG}: '$1' はまだ実装していません(開発中: ${WP_RELEASE_ZIP_MAKER_VERSION})."
 	exit "${EXIT_USAGE}"
 }
+
+# --- 文字列・版の小さな道具 ---------------------------------------------------------------------
+
+# 前後の空白を取る. 引数の文字列を標準出力へ出す.
+trim() {
+	local s="$1"
+	s="${s#"${s%%[![:space:]]*}"}"
+	s="${s%"${s##*[![:space:]]}"}"
+	printf '%s' "${s}"
+}
+
+# 「X.Y.Z」の 3 つ組の版を比べて、$1 が $2 以上なら 0 を返す. どちらも数字 3 つ組であること(呼ぶ前に確かめる).
+version_ge() {
+	local a1 a2 a3 b1 b2 b3
+	IFS=. read -r a1 a2 a3 <<<"$1"
+	IFS=. read -r b1 b2 b3 <<<"$2"
+	# 先頭に 0 がある数字を 8 進数と読まないよう、10# を付けて 10 進数で比べる.
+	[ "$((10#${a1}))" -ne "$((10#${b1}))" ] && { [ "$((10#${a1}))" -gt "$((10#${b1}))" ]; return; }
+	[ "$((10#${a2}))" -ne "$((10#${b2}))" ] && { [ "$((10#${a2}))" -gt "$((10#${b2}))" ]; return; }
+	[ "$((10#${a3}))" -ge "$((10#${b3}))" ]
+}
+
+# スラッグとして使える文字だけか(英数字・ドット・ハイフン・アンダースコア. 空と先頭のドットは不可).
+valid_slug() {
+	case "$1" in
+		'' | .* | *[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	return 0
+}
+
+# 設定ファイルの中のパスとして使えるか(相対パス・'..' を含まない. '.' だけは設定ファイルのある場所を指す).
+valid_rel_path() {
+	case "$1" in
+		'' | /* | .. | ../* | */.. | */../*) return 1 ;;
+	esac
+	return 0
+}
+
+# --- 設定ファイル -------------------------------------------------------------------------------
+
+# 設定ファイルを探す. カレントから上へ、Git のルート(含む)まで. 見つけたら CONFIG_FILE / CONFIG_DIR を埋める.
+find_config() {
+	local top dir
+	top="$(git rev-parse --show-toplevel 2>/dev/null)" ||
+		die "Git リポジトリの中で実行してください(カレントは Git の管理下ではありません)."
+	# 比べやすいよう、シンボリックリンクを解いた絶対パスにそろえる.
+	top="$(cd "${top}" && pwd -P)"
+	dir="$(pwd -P)"
+	while :; do
+		if [ -f "${dir}/${CONFIG_NAME}" ]; then
+			CONFIG_FILE="${dir}/${CONFIG_NAME}"
+			CONFIG_DIR="${dir}"
+			return 0
+		fi
+		# Git のルートまで探して無ければ、そこで止める.
+		if [ "${dir}" = "${top}" ] || [ "${dir}" = "/" ]; then
+			break
+		fi
+		dir="$(dirname "${dir}")"
+	done
+	die "設定ファイル ${CONFIG_NAME} が見つかりません(Git のルート ${top} まで探しました). examples/${CONFIG_NAME} を参考に作ってください."
+}
+
+# 設定ファイルを読み、グローバルの T_* / C_* / CFG_* を埋める. 形式の誤りはすべて行番号つきで止める.
+# 形式(jq に頼らず bash で読める行の形式):
+#   key = value               key は tag_format / output / requires
+#   <plugin|theme|dir> <パス> [スラッグ]
+#   check <パス>:<正規表現>
+# '#' で始まる行と、空白の後ろの '#' 以降はコメント(check の正規表現に ' #' を含められない).
+load_config() {
+	find_config
+
+	local line lineno=0 first rest value kind path slug extra
+	local seen_tag_format=0 seen_output=0 seen_requires=0
+
+	while IFS= read -r line || [ -n "${line}" ]; do
+		lineno=$((lineno + 1))
+		# Windows の改行(CR)を落とし、コメントと前後の空白を取る.
+		line="${line%$'\r'}"
+		line="${line%%[[:space:]]#*}"
+		line="$(trim "${line}")"
+		case "${line}" in
+			'' | '#'*) continue ;;
+		esac
+
+		# 1 語目で行の種類を決める('=' の直前でも区切る: 'output=..' も読めるように).
+		first="${line%%[[:space:]=]*}"
+		rest="$(trim "${line#"${first}"}")"
+
+		case "${first}" in
+			tag_format | output | requires)
+				case "${rest}" in
+					=*) value="$(trim "${rest#=}")" ;;
+					*) die "${CONFIG_NAME}:${lineno}: '${first} = 値' の形で書いてください." ;;
+				esac
+				[ -n "${value}" ] || die "${CONFIG_NAME}:${lineno}: ${first} の値が空です."
+				case "${first}" in
+					tag_format)
+						[ "${seen_tag_format}" -eq 0 ] || die "${CONFIG_NAME}:${lineno}: tag_format が 2 回書かれています."
+						seen_tag_format=1
+						CFG_TAG_FORMAT="${value}"
+						;;
+					output)
+						[ "${seen_output}" -eq 0 ] || die "${CONFIG_NAME}:${lineno}: output が 2 回書かれています."
+						seen_output=1
+						CFG_OUTPUT="${value}"
+						;;
+					requires)
+						[ "${seen_requires}" -eq 0 ] || die "${CONFIG_NAME}:${lineno}: requires が 2 回書かれています."
+						seen_requires=1
+						CFG_REQUIRES="${value}"
+						;;
+				esac
+				;;
+			plugin | theme | dir)
+				kind="${first}"
+				# 空白区切りの最大 3 語(パス・スラッグ・余り). read は globbing をしないので '*' を含んでも安全.
+				read -r path slug extra <<<"${rest}"
+				[ -n "${path}" ] || die "${CONFIG_NAME}:${lineno}: ${kind} のパスがありません."
+				[ -z "${extra}" ] || die "${CONFIG_NAME}:${lineno}: ${kind} の行に余分な語があります('${extra}'). 書式は '${kind} <パス> [スラッグ]' です."
+				valid_rel_path "${path}" ||
+					die "${CONFIG_NAME}:${lineno}: パス '${path}' は、設定ファイルからの相対パスで、'..' を含まない形にしてください."
+				if [ -z "${slug}" ]; then
+					# スラッグ省略時はディレクトリ名. '.' はディレクトリ名が決まらないので省略できない.
+					[ "${path}" != "." ] ||
+						die "${CONFIG_NAME}:${lineno}: パスが '.' のときはスラッグを書いてください('${kind} . my-slug')."
+					slug="$(basename "${path}")"
+				fi
+				valid_slug "${slug}" ||
+					die "${CONFIG_NAME}:${lineno}: スラッグ '${slug}' は、英数字・ドット・ハイフン・アンダースコアだけにしてください(先頭のドットは不可)."
+				T_KIND[${#T_KIND[@]}]="${kind}"
+				T_PATH[${#T_PATH[@]}]="${path}"
+				T_SLUG[${#T_SLUG[@]}]="${slug}"
+				;;
+			check)
+				case "${rest}" in
+					*:*) ;;
+					*) die "${CONFIG_NAME}:${lineno}: check は 'check <パス>:<正規表現>' の形で書いてください." ;;
+				esac
+				path="${rest%%:*}"
+				value="${rest#*:}"
+				valid_rel_path "${path}" ||
+					die "${CONFIG_NAME}:${lineno}: check のパス '${path}' は、設定ファイルからの相対パスで、'..' を含まない形にしてください."
+				[ -n "${value}" ] || die "${CONFIG_NAME}:${lineno}: check の正規表現が空です."
+				C_PATH[${#C_PATH[@]}]="${path}"
+				C_REGEX[${#C_REGEX[@]}]="${value}"
+				;;
+			*)
+				die "${CONFIG_NAME}:${lineno}: 読めない行です('${line}')."
+				;;
+		esac
+	done <"${CONFIG_FILE}"
+
+	validate_config
+}
+
+# 読み込んだ設定の全体としての整合を確かめる(行ごとの形式は load_config で確かめ済み).
+validate_config() {
+	local n="${#T_KIND[@]}" i j
+
+	[ "${n}" -gt 0 ] || die "${CONFIG_NAME}: 対象(plugin / theme / dir の行)が 1 つもありません."
+	# output は必須にする: 省略時の置き場所を決めると、Git の中に Zip を作ってしまう事故につながるため.
+	[ -n "${CFG_OUTPUT}" ] || die "${CONFIG_NAME}: output(Zip の出力先)を書いてください(Git と docroot の外を推奨)."
+
+	# tag_format の省略時は、対象が 1 つなら {version}・複数なら {slug}/{version}.
+	if [ -z "${CFG_TAG_FORMAT}" ]; then
+		if [ "${n}" -eq 1 ]; then
+			CFG_TAG_FORMAT="{version}"
+		else
+			CFG_TAG_FORMAT="{slug}/{version}"
+		fi
+	fi
+	case "${CFG_TAG_FORMAT}" in
+		*'{version}'*) ;;
+		*) die "${CONFIG_NAME}: tag_format には {version} を含めてください('${CFG_TAG_FORMAT}')." ;;
+	esac
+	# 複数の対象で {slug} が無いと、別の対象のタグが衝突する.
+	if [ "${n}" -gt 1 ]; then
+		case "${CFG_TAG_FORMAT}" in
+			*'{slug}'*) ;;
+			*) die "${CONFIG_NAME}: 対象が複数あるので、tag_format には {slug} も含めてください('${CFG_TAG_FORMAT}')." ;;
+		esac
+	fi
+
+	# スラッグの重複(Zip の名前・タグが衝突する).
+	i=0
+	while [ "${i}" -lt "${n}" ]; do
+		j=$((i + 1))
+		while [ "${j}" -lt "${n}" ]; do
+			[ "${T_SLUG[${i}]}" != "${T_SLUG[${j}]}" ] ||
+				die "${CONFIG_NAME}: スラッグ '${T_SLUG[${i}]}' が重複しています(${T_PATH[${i}]} と ${T_PATH[${j}]})."
+			j=$((j + 1))
+		done
+		i=$((i + 1))
+	done
+
+	# requires: ツールの版が足りなければ止める.
+	if [ -n "${CFG_REQUIRES}" ]; then
+		# 数字 3 つをドットでつないだ形だけ(1.2 や 1.2.3.4・1.a.3 は弾く).
+		printf '%s\n' "${CFG_REQUIRES}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' ||
+			die "${CONFIG_NAME}: requires は 'X.Y.Z' の形で書いてください('${CFG_REQUIRES}')."
+		version_ge "${WP_RELEASE_ZIP_MAKER_VERSION}" "${CFG_REQUIRES}" ||
+			die "このツール(${WP_RELEASE_ZIP_MAKER_VERSION})は古すぎます. ${CONFIG_NAME} は ${CFG_REQUIRES} 以上を求めています. ツールを更新してください."
+	fi
+}
+
+# --- 版・タグ -----------------------------------------------------------------------------------
+
+# 種類ごとに、版をどこから読むかの説明(--list や止めるときのメッセージで使う).
+version_source() {
+	case "$1" in
+		theme) printf '%s' "style.css の Version:" ;;
+		plugin) printf '%s' "直下の *.php のうち Plugin Name: を持つファイルの Version:" ;;
+		dir) printf '%s' "VERSION ファイルの 1 行目" ;;
+	esac
+}
+
+# ファイルの先頭 $2 バイトから「Version: x」の x を 1 つ取り出す(WordPress のヘッダーと同じ読み方).
+# 行頭の空白・'*'・'#'・'@' は読み飛ばす(docblock の ' * Version: 1.0' に対応).
+header_version() {
+	head -c "$2" "$1" | sed -n 's/^[[:space:]*#@]*Version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1
+}
+
+# 対象の版を読んで標準出力へ出す. 読めなければ何も出さず 1 を返す.
+#   $1 = 種類 / $2 = 対象のディレクトリ(絶対パス)
+read_version() {
+	local kind="$1" dir="$2" v="" f
+	case "${kind}" in
+		theme)
+			[ -f "${dir}/style.css" ] && v="$(header_version "${dir}/style.css" 5000)"
+			;;
+		plugin)
+			# WordPress は Plugin Name: を先頭 8KB から探す. 同じ階層の php を名前順に見て、最初に見つかったものを使う.
+			for f in "${dir}"/*.php; do
+				[ -f "${f}" ] || continue
+				if head -c 8192 "${f}" | grep -q '^[[:space:]*#@]*Plugin Name:'; then
+					v="$(header_version "${f}" 8192)"
+					break
+				fi
+			done
+			;;
+		dir)
+			if [ -f "${dir}/VERSION" ]; then
+				IFS= read -r v <"${dir}/VERSION" || true
+				v="$(trim "${v}")"
+			fi
+			;;
+	esac
+	[ -n "${v}" ] || return 1
+	printf '%s' "${v}"
+}
+
+# タグ名を作る. $1 = スラッグ / $2 = 版.
+make_tag() {
+	local t="${CFG_TAG_FORMAT}"
+	t="${t//\{slug\}/$1}"
+	t="${t//\{version\}/$2}"
+	printf '%s' "${t}"
+}
+
+# タグがあるか. $1 = タグ名.
+tag_exists() {
+	git -C "${CONFIG_DIR}" rev-parse -q --verify "refs/tags/$1" >/dev/null 2>&1
+}
+
+# --- --list -------------------------------------------------------------------------------------
+
+# 設定にある対象と、今の版(作業ツリーのファイル)・タグの有無を一覧にする.
+cmd_list() {
+	load_config
+
+	local n="${#T_KIND[@]}" i abs ver tag tagged out
+	printf '設定:       %s\n' "${CONFIG_FILE}"
+	printf 'タグの形式: %s\n' "${CFG_TAG_FORMAT}"
+	# output は設定ファイルからの相対パス(絶対パスならそのまま).
+	case "${CFG_OUTPUT}" in
+		/*) out="${CFG_OUTPUT}" ;;
+		*) out="${CONFIG_DIR}/${CFG_OUTPUT}" ;;
+	esac
+	printf '出力先:     %s\n' "${out}"
+	printf '\n'
+	# 列の見出しは、日本語だと桁がそろわないので英字にする.
+	printf '%-7s %-28s %-10s %-34s %-6s %s\n' KIND SLUG VERSION TAG TAGGED PATH
+
+	i=0
+	while [ "${i}" -lt "${n}" ]; do
+		abs="${CONFIG_DIR}/${T_PATH[${i}]}"
+		if [ ! -d "${abs}" ]; then
+			# ディレクトリが無い: 版もタグも決められない. 一覧には出して印を付ける.
+			printf '%-7s %-28s %-10s %-34s %-6s %s\n' \
+				"${T_KIND[${i}]}" "${T_SLUG[${i}]}" '?' '-' '-' "${T_PATH[${i}]} (ディレクトリがありません)"
+		elif ver="$(read_version "${T_KIND[${i}]}" "${abs}")"; then
+			tag="$(make_tag "${T_SLUG[${i}]}" "${ver}")"
+			if tag_exists "${tag}"; then tagged="yes"; else tagged="no"; fi
+			printf '%-7s %-28s %-10s %-34s %-6s %s\n' \
+				"${T_KIND[${i}]}" "${T_SLUG[${i}]}" "${ver}" "${tag}" "${tagged}" "${T_PATH[${i}]}"
+		else
+			printf '%-7s %-28s %-10s %-34s %-6s %s\n' \
+				"${T_KIND[${i}]}" "${T_SLUG[${i}]}" '?' '-' '-' \
+				"${T_PATH[${i}]} (版を読めません: $(version_source "${T_KIND[${i}]}"))"
+		fi
+		i=$((i + 1))
+	done
+}
+
+# --- 入口 ---------------------------------------------------------------------------------------
 
 main() {
 	# 引数なしは使い方の誤り. 説明を標準エラーに出して終了する.
@@ -80,7 +412,7 @@ main() {
 		esac
 	done
 
-	# 残りの引数を解釈する. Step 2 以降で中身を実装する.
+	# 残りの引数を解釈する.
 	local slug="" mode="build"
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
@@ -111,7 +443,12 @@ main() {
 
 	# --list はスラッグを取らない. それ以外はスラッグが要る.
 	if [ "${mode}" = "list" ]; then
-		not_implemented "--list"
+		if [ -n "${slug}" ]; then
+			err "${PROG}: --list にはスラッグを付けられません('${slug}')."
+			exit "${EXIT_USAGE}"
+		fi
+		cmd_list
+		exit 0
 	fi
 	if [ -z "${slug}" ]; then
 		err "${PROG}: スラッグを指定してください."

@@ -1,0 +1,22 @@
+# wp-release-zip-maker の設定の見本(docroot 型: 1 つのリポジトリにテーマ・プラグイン・ディレクトリが入る).
+# Git のルート(docroot)に ".wp-release" という名前で置く.
+# 書式: '#' で始まる行と、空白の後ろの '#' 以降はコメント. check の正規表現に ' #' は書けない.
+
+# タグの形式. {slug} と {version} が使える. 対象が複数あるなら {slug} が要る.
+# 対象が 1 つだけなら省略できる(省略すると {version}).
+tag_format = {slug}/{version}
+
+# Zip の出力先(必須). この設定ファイルからの相対パス. Git と docroot の外を推奨.
+output     = ../releases
+
+# このツールの最低の版. 古ければ止める(任意).
+requires   = 0.1.0
+
+# 対象: 種類(plugin / theme / dir)  パス(設定ファイルからの相対)  スラッグ(省略時はディレクトリ名)
+plugin   wp-content/plugins/my-plugin
+theme    wp-content/themes/my-theme
+dir      lp                                landing
+
+# 版の表記がそろっているかを確かめる追加のファイル(任意). 書式: check パス:その行を探す正規表現
+# 行の中に版番号があればよい. (確認の処理は開発中です)
+check    wp-content/plugins/my-plugin/package.json:"version"
