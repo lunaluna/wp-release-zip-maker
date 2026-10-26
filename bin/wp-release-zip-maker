@@ -69,6 +69,8 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
       HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない)
   ${PROG} <slug> --dry-run
       確認だけ(Zip もタグも作らない)
+  ${PROG} <slug> [--rebuild [<版>]] --manifest
+      Zip のファイルごとの SHA-256 の一覧(<slug>.<版>.manifest.txt)も、出力先に作る
   ${PROG} <slug> --rebuild [<版>]
       既存のタグの時点から Zip だけを作り直す(タグは打たない). 版を省くと HEAD の版.
       --dry-run と組み合わせられる. 作り直した Zip の内容の指紋がタグの記録と違うと、
@@ -678,16 +680,13 @@ sha256_files_stdin() {
 	fi
 }
 
-# Zip の「内容の指紋」を標準出力へ出す. unzip が無い・展開できない・ファイルが 1 つも無ければ、何も出さず 1 を返す.
-# 中身は、Zip を一時ディレクトリへ展開し、次の 3 種類の行を並べ替えて SHA-256 にしたもの(時刻・属性・圧縮のしかたを含まない):
-#   F <内容の SHA-256> <パス>   通常のファイル(内容そのものを SHA-256 にする)
-#   X <パス>                    実行権限(所有者)があるファイル
-#   L <パス> -> <リンク先>      シンボリックリンク
+# Zip の中身を一時ディレクトリへ展開し、内容を表す行を並べ替えて標準出力へ出す(内容の指紋とマニフェストの元になるデータ). 展開できない・ファイルが 1 つも無ければ、何も出さず 1 を返す.
+#   F <内容の SHA-256> ./<パス>   通常のファイル(内容そのものを SHA-256 にする)
+#   X ./<パス>                    実行権限(所有者)があるファイル
+#   L ./<パス> -> <リンク先>      シンボリックリンク
 # 空のディレクトリは入れない(dist-archive の経路によって空エントリが出たり出なかったりするため. ファイルがあれば、その親は暗黙に決まる).
-# 以前は unzip -v の CRC-32 と名前から作っていた. CRC-32 は、同じ値になる別の内容を意図的に作れるので、同じ内容かどうかの根拠にならない(2026-10-26 のレビュー).
-# Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため. 2026-10-26 に確認). 内容が同じかどうかは、この指紋で比べる.
 # 展開先は TMP_WORK の下に作る(make_zip が作り、終了時に cleanup_tmp が消す. 途中で中断されても取り残さない). パスの ASCII 以外のバイトは、そのまま扱う(LC_ALL=C).
-zip_content_digest() {
+zip_scan() {
 	local dir lines
 	command -v unzip >/dev/null 2>&1 || return 1
 	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || return 1
@@ -705,9 +704,43 @@ zip_content_digest() {
 		} | LC_ALL=C sort
 	)"
 	rm -rf -- "${dir}"
-	# F の行が 1 つも無い(= ファイルが無い)Zip は、指紋にしない.
+	# F の行が 1 つも無い(= ファイルが無い)Zip は、データにしない.
 	printf '%s\n' "${lines}" | grep -q '^F ' || return 1
-	printf '%s\n' "${lines}" | sha256_stdin
+	printf '%s\n' "${lines}"
+}
+
+# Zip の「内容の指紋」を標準出力へ出す. unzip が無い・展開できない・ファイルが無ければ、何も出さず 1 を返す.
+# zip_scan の行(ファイルの内容・実行権限・リンク先を含み、時刻・属性・圧縮のしかたを含まない)を SHA-256 にしたもの.
+# 以前は unzip -v の CRC-32 と名前から作っていた. CRC-32 は、同じ値になる別の内容を意図的に作れるので、同じ内容かどうかの根拠にならない(2026-10-26 のレビュー).
+# Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため. 2026-10-26 に確認). 内容が同じかどうかは、この指紋で比べる.
+zip_content_digest() {
+	local scan
+	scan="$(zip_scan "$1")" || return 1
+	printf '%s\n' "${scan}" | sha256_stdin
+}
+
+# Zip のマニフェスト(ファイルごとの "<SHA-256>  <Zip の一番上のフォルダーからのパス>")を標準出力へ出す. zip_scan が出せなければ、何も出さず 1 を返す.
+# 内容の指紋と同じデータ(zip_scan の F の行)から作るので、両者は食い違わない. 形は shasum -a 256 -c が読める('  ' の 2 つの空白).
+# 展開した Zip のディレクトリで `shasum -a 256 -c <マニフェスト>` を実行すれば、中身が同じかを照合できる.
+# 実行権限とシンボリックリンクは載せない(内容の指紋には入っている).
+zip_manifest() {
+	local scan
+	scan="$(zip_scan "$1")" || return 1
+	printf '%s\n' "${scan}" | LC_ALL=C sed -n 's/^F \([0-9a-f]\{64\}\) \.\//\1  /p'
+}
+
+# Zip のマニフェストを作って、出力先へ上書きせずに置き、場所とファイル数を表示する. 作れなければ(unzip が無い・展開できない)非 0 を返す.
+#   $1 = Zip のパス / $2 = マニフェストの最終のパス
+write_manifest() {
+	local zip_file="$1" dest="$2" tmp n
+	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || return 1
+	tmp="${TMP_WORK}/manifest.txt"
+	zip_manifest "${zip_file}" >"${tmp}" || return 1
+	[ -s "${tmp}" ] || return 1
+	n="$(wc -l <"${tmp}")"
+	n=$((n))
+	publish_zip "${tmp}" "${dest}" "マニフェスト"
+	printf 'マニフェスト: %s (%s ファイル. 展開した Zip のディレクトリで shasum -a 256 -c で照合できます)\n' "${dest}" "${n}"
 }
 
 # バイト数を読みやすい単位にして標準出力へ出す.
@@ -769,31 +802,32 @@ ${wp_out}"
 	publish_zip "${built}" "${zip_file}"
 }
 
-# 作った Zip($1)を、最終のパス($2)へ、上書きせずに置く. すでに何かあれば(壊れたシンボリックリンクも)、置かずに止める.
+# 作ったファイル($1)を、最終のパス($2)へ、上書きせずに置く. すでに何かあれば(壊れたシンボリックリンクも)、置かずに止める.
+# $3 = 表示に使う呼び名(省略すると Zip. マニフェストも同じ手順で置くため).
 # 手順: 出力先と同じディスク上の一時ファイルへコピー → ln(ハードリンク)で最終のパスの名前を作る → 一時ファイルを消す.
 #   ln は、行き先がすでにあれば必ず失敗する(確認と作成が 1 つの操作になる). 一時ファイルは出力先と同じディスクに作るので、ln が使える.
 #   ハードリンクを作れないファイルシステムでは、mv -n で置く(あとで一時ファイルが残っていれば、すでにあったと判断する).
 # 一時ファイルは mktemp の 0600 のままにせず、umask どおりの権限にする(以前の dist-archive の出力と同じ).
 publish_zip() {
-	local src="$1" dest="$2" dir mode
+	local src="$1" dest="$2" label="${3:-Zip}" dir mode
 	dir="$(dirname "${dest}")"
 	mkdir -p -- "${dir}" || die "出力先 ${dir} を作れません."
 	PART_FILE="$(mktemp "${dir}/.$(basename "${dest}").XXXXXX")" || die "出力先 ${dir} に一時ファイルを作れません(書き込めますか?)."
 	mode="$(printf '%o' $((0666 & ~$(umask))))"
 	if ! { cp -- "${src}" "${PART_FILE}" && chmod "${mode}" "${PART_FILE}"; }; then
-		die "Zip を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)."
+		die "${label} を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)."
 	fi
 	if [ -e "${dest}" ] || [ -L "${dest}" ]; then
-		die "Zip がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+		die "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
 	fi
 	if ! ln -- "${PART_FILE}" "${dest}" 2>/dev/null; then
 		if [ -e "${dest}" ] || [ -L "${dest}" ]; then
-			die "Zip がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+			die "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
 		fi
 		# ハードリンクを作れない(ln が使えないファイルシステム). mv -n は、行き先があれば動かない.
 		mv -n -- "${PART_FILE}" "${dest}" 2>/dev/null
 		if [ -e "${PART_FILE}" ]; then
-			die "Zip を ${dest} へ置けませんでした(すでにあるか、書き込めません)."
+			die "${label} を ${dest} へ置けませんでした(すでにあるか、書き込めません)."
 		fi
 	fi
 	rm -f -- "${PART_FILE}"
@@ -1038,6 +1072,7 @@ read_version_at() {
 
 # 3 つの動作の事前の確認と実行.
 #   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
+#   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1045,7 +1080,7 @@ read_version_at() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5"
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1146,6 +1181,14 @@ cmd_build() {
 		fi
 	fi
 
+	# マニフェスト(--manifest): Zip と同じく上書きしない. すでにあれば、何も作らずに止める(Zip だけ作ってから止まらないよう、ここで確かめる).
+	if [ "${manifest}" -eq 1 ]; then
+		manifest_file="${out}/${slug}.${ver}.manifest.txt"
+		if [ -e "${manifest_file}" ] || [ -L "${manifest_file}" ]; then
+			die "マニフェストがすでにあります(${manifest_file}). このツールは上書きしません. 確かめて消してから実行してください."
+		fi
+	fi
+
 	# 出力先が Git の中で、無視もされていなければ、作った Zip が次回の作業ツリーを汚す(警告だけ).
 	case "${out}/" in
 		"${GIT_TOP}"/*)
@@ -1188,6 +1231,7 @@ cmd_build() {
 			printf 'タグ:       %s (まだありません・打つコミット %s)\n' "${tag}" "${short}"
 		fi
 		printf 'Zip:        %s\n' "${zip_file}"
+		[ "${manifest}" -eq 0 ] || printf 'マニフェスト: %s\n' "${manifest_file}"
 		return 0
 	fi
 
@@ -1198,6 +1242,10 @@ cmd_build() {
 		printf '\n'
 		print_zip_summary "${slug}" "${zip_file}"
 		check_rebuild_digest "${tag}" "${zip_file}" "${allow_change}"
+		# 内容の指紋の確認のあとで作る(不一致で止めるとき、マニフェストを残さない). 作れなければ Zip も消す.
+		if [ "${manifest}" -eq 1 ]; then
+			write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました)."; }
+		fi
 		print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 		return 0
 	fi
@@ -1205,8 +1253,13 @@ cmd_build() {
 	printf '%s (%s) を作ります: 版 %s・HEAD %s\n' "${slug}" "${kind}" "${ver}" "${short}"
 	make_zip "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}"
 	# タグを打てなければ、Zip も消す(「タグの無い Zip」を残すと、次回の実行が止まるため).
+	# マニフェストは、タグより先に作る(作れなければ、タグを打たずに Zip も消す). タグを打てなければ、マニフェストも消す.
+	if [ "${manifest}" -eq 1 ]; then
+		write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました). unzip があるか確かめてください."; }
+	fi
 	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}"; then
 		rm -f -- "${zip_file}"
+		[ "${manifest}" -eq 0 ] || rm -f -- "${manifest_file}"
 		die "タグ ${tag} を打てませんでした(Zip は消しました). Git のエラーを確かめてから、もう一度実行してください."
 	fi
 	printf '\n'
@@ -1432,13 +1485,14 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
 			--dry-run) dry=1 ;;
 			--rebuild) rebuild=1 ;;
 			--allow-content-change) allow_change=1 ;;
+			--manifest) manifest=1 ;;
 			-*)
 				err "${PROG}: 不明なオプション '$1'"
 				err "'${PROG} --help' で使い方を確認してください."
@@ -1460,7 +1514,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1484,7 +1538,7 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}"
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}"
 }
 
 main "$@"

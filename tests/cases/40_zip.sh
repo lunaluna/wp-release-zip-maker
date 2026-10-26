@@ -262,6 +262,94 @@ test_path_traversal_entry_in_the_zip_stops() {
 	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
 }
 
+# --- マニフェスト(--manifest) ---------------------------------------------------------------------
+
+# --manifest を付けると、<出力先>/<slug>.<版>.manifest.txt に、Zip の中のファイルごとの "<SHA-256>  <パス>" を書くこと.
+# 展開した Zip で `shasum -c` が全部通ること(空白入りの名前も含む)・ディレクトリは含まないこと・付けなければ作らないこと.
+test_manifest_lists_every_file_with_its_sha256() {
+	need_real_wp || return 0
+	mk_docroot m1
+	run_tool my-plugin; assert_rc 0
+	assert_no_file "${OUTD}/my-plugin.1.2.3.manifest.txt"            # 付けなければ作らない
+	mk_docroot m2
+	run_tool my-plugin --manifest
+	assert_rc 0
+	local z="${OUTD}/my-plugin.1.2.3.zip" mf="${OUTD}/my-plugin.1.2.3.manifest.txt" x="${TEST_ROOT}/m2x" n_files
+	assert_file "${mf}"
+	assert_has "マニフェスト:"
+	# 行の形: 64 桁の 16 進数 + 空白 2 つ + パス(Zip の一番上のフォルダーから).
+	if grep -avEq '^[0-9a-f]{64}  my-plugin/[^[:cntrl:]]+$' "${mf}"; then fail "行の形が違うものがあります: $(grep -avE '^[0-9a-f]{64}  my-plugin/' "${mf}" | head -n 3)"; fi
+	n_files="$(unzip -Z1 "${z}" | grep -vc '/$')"
+	assert_eq "${n_files}" "$(wc -l < "${mf}" | tr -d ' ')" "マニフェストの行数(Zip のファイル数)"
+	grep -aq '  my-plugin/my main.php$' "${mf}" || fail "空白入りの名前の行がありません"
+	# 展開して、shasum -c で全部通ること.
+	mkdir -p "${x}" && unzip -q "${z}" -d "${x}"
+	(cd "${x}" && shasum -a 256 -c "${mf}" >/dev/null 2>&1) || fail "展開した Zip が、マニフェストと一致しません"
+	# 内容を変えると、通らなくなること(照合に使える).
+	echo tampered >> "${x}/my-plugin/assets/app.js"
+	(cd "${x}" && shasum -a 256 -c "${mf}" >/dev/null 2>&1) && fail "改ざんしたのに、照合が通りました"
+}
+
+# マニフェストがすでにあるときは、何も作らずに止めること(Zip・タグも). 壊れたシンボリックリンクも「ある」とみなす.
+test_existing_manifest_stops_before_anything_is_made() {
+	need_real_wp || return 0
+	mk_docroot m3
+	mkdir -p "${OUTD}" && echo mine > "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	run_tool my-plugin --manifest
+	assert_rc 1
+	assert_has "マニフェストがすでにあります"
+	assert_eq "mine" "$(cat "${OUTD}/my-plugin.1.2.3.manifest.txt")" "既存のマニフェスト(上書きしない)"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+	rm -f "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	ln -s "${TEST_ROOT}/victim.txt" "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	LABEL="壊れたシンボリックリンク"; run_tool my-plugin --manifest
+	assert_rc 1
+	assert_has "マニフェストがすでにあります"
+	assert_no_file "${TEST_ROOT}/victim.txt"
+}
+
+# --dry-run と組み合わせると、作らずに、パスを表示すること. --list とは組み合わせられない.
+test_manifest_with_dry_run_and_list() {
+	need_real_wp || return 0
+	mk_docroot m4
+	run_tool my-plugin --manifest --dry-run
+	assert_rc 0
+	assert_has "マニフェスト: ${OUTD}/my-plugin.1.2.3.manifest.txt"
+	assert_no_file "${OUTD}"
+	LABEL="--list"; run_tool --list --manifest
+	assert_rc 2
+	assert_has "--list には"
+}
+
+# タグを打てなかったときは、Zip と一緒にマニフェストも消すこと.
+test_tag_failure_removes_the_manifest_too() {
+	need_real_wp || return 0
+	mk_docroot m5
+	run_tool_env GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=tag.gpgSign GIT_CONFIG_VALUE_0=true GIT_CONFIG_KEY_1=gpg.program "GIT_CONFIG_VALUE_1=$(command -v false)" -- my-plugin --manifest
+	assert_rc 1
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	assert_eq "1" "$(find "${OUTD}" 2>/dev/null | wc -l | tr -d ' ')" "出力先の中(ディレクトリだけ)"
+}
+
+# --rebuild でも作れること. 内容の指紋が違って止めるときは、マニフェストを残さないこと.
+test_manifest_with_rebuild() {
+	need_real_wp || return 0
+	mk_docroot m6
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	run_tool my-plugin --rebuild --manifest
+	assert_rc 0
+	assert_file "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	# 指紋の違うタグに付け替えて、止まる場合.
+	rm -f "${OUTD}/my-plugin.1.2.3.zip" "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	printf 'my-plugin 1.2.3\n\nZip: x\nSHA-256: %064d\nContent-SHA-256: %064d\nBuilt-with: x\n' 0 1 | git tag -f -a -F - my-plugin/1.2.3 HEAD >/dev/null
+	LABEL="不一致"; run_tool my-plugin --rebuild --manifest
+	assert_rc 1
+	assert_no_file "${OUTD}/my-plugin.1.2.3.manifest.txt"
+}
+
 # --- 出力 Zip の排他(上書きしない) --------------------------------------------------------------
 
 # 出力先に、壊れたシンボリックリンク(行き先が無い)が同名であれば、その先へ書かず、すでにあるものとして止めること.
@@ -368,7 +456,8 @@ test_failures_leave_nothing_behind() {
 	mk_docroot z10
 	expect_failure_leaves_nothing "wp が失敗" 'echo "Error: boom" >&2; exit 1' "Error: boom"
 	expect_failure_leaves_nothing "途中まで作って失敗" 'mkdir -p "$(dirname "$3")"; cd "$2" && zip -q "$3" -r . ; echo "Error: half" >&2; exit 1' "Error: half"
-	expect_failure_leaves_nothing "一番上のフォルダーがスラッグでない Zip" 'mkdir -p "$(dirname "$3")"; d=$(mktemp -d); echo 1 > "$d/stray.txt"; (cd "$d" && zip -q "$3" stray.txt); echo "Success: fake"' "Zip の中に、my-plugin/ の外のファイルがあります"
+	# 作業用のディレクトリは、mktemp を使わず、Zip の出力先の中に作る(引数なしの mktemp -d は /var/folders に作ろうとし、サンドボックス内で拒否されるため).
+	expect_failure_leaves_nothing "一番上のフォルダーがスラッグでない Zip" 'mkdir -p "$(dirname "$3")"; d="$(dirname "$3")/stray-work"; mkdir -p "$d"; echo 1 > "$d/stray.txt"; (cd "$d" && zip -q "$3" stray.txt); rm -rf "$d"; echo "Success: fake"' "Zip の中に、my-plugin/ の外のファイルがあります"
 }
 
 tests_main "$@"

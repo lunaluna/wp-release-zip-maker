@@ -78,6 +78,7 @@ wp-release-zip-maker <slug>                    # HEAD から Zip を作り、注
 wp-release-zip-maker <slug> --dry-run          # 確認だけ(Zip もタグも作らない)
 wp-release-zip-maker <slug> --rebuild [<版>]   # 既存のタグの時点から Zip だけを作り直す(タグは打たない)
 wp-release-zip-maker <slug> --rebuild [<版>] --allow-content-change   # 内容の指紋がタグの記録と違っても続ける
+wp-release-zip-maker <slug> [--rebuild [<版>]] --manifest             # Zip のファイルごとの SHA-256 の一覧も作る
 wp-release-zip-maker --list                    # 設定にある対象と、今の版・タグの有無を一覧にする
 wp-release-zip-maker --version / --help
 ```
@@ -228,6 +229,22 @@ wp-release-zip-maker my-plugin --rebuild 1.2.3     # 版を指定する(版を�
 - **Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わります**(`zip` が時刻などの属性を入れるため)。
   そのため、作り直した Zip の SHA-256 とタグの記録は一致しません。これは正常です。配布した Zip の現物を照合するときは、その Zip の SHA-256 をタグに記録された `SHA-256` と比べてください
 - タグが、このツールで打ったものでない(`Content-SHA-256` がない)ときや、`unzip` が無くて指紋を計算できないときは、比べようがないので、止めずに「中身を目で確かめてください」と表示します
+
+### `--manifest`(Zip の内容のマニフェスト)
+
+`--manifest` を付けると、Zip と同じ出力先に **`<slug>.<版>.manifest.txt`** を作ります(通常の実行・`--rebuild` のどちらでも)。
+Zip の中のファイルごとに、`<SHA-256>` と、Zip の一番上のフォルダーからのパスを並べたものです(`shasum -a 256 -c` が読める形)。
+
+```text
+3b0c…(64 桁)  my-plugin/my main.php
+a7f1…(64 桁)  my-plugin/assets/app.js
+```
+
+- 展開した Zip(またはサーバーに置いたディレクトリ)の**親のディレクトリ**で `shasum -a 256 -c <マニフェスト>` を実行すると、中身が同じかを照合できます(1 つでも違えば失敗します)
+- 内容の指紋(`Content-SHA-256`)と**同じデータ**から作るので、両者は食い違いません。ただし、マニフェストには実行権限とシンボリックリンクは載せません(指紋には入っています)。ディレクトリも載せません
+- **上書きしません。** すでにあれば、Zip もタグも作らずに止めます(`--dry-run` でも確かめられます)。タグを打てなかったときは、Zip と一緒に消します。`--rebuild` で内容の指紋が違って止めるときは、作りません
+- `unzip` が必要です(無ければ、マニフェストを作れず、Zip も消して止めます)
+- 付けなければ作りません(出力先のファイルが増えるため、既定では作らない設計です)
 
 ### アップロードの手順(Zip を作ったあとに表示)
 
