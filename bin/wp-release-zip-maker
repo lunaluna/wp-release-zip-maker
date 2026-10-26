@@ -1164,6 +1164,20 @@ check_rebuild_digest() {
 
 # --- アップロードの手順の表示 -------------------------------------------------------------------
 
+# 文字列を、シェルに 1 つの語として渡せる形にして標準出力へ出す(表示した手順を貼り付けても、意図しないコマンドにならないように).
+# 安全な文字だけ(英数字と _ / . , : @ % + = -)なら、そのまま出す. それ以外が 1 つでもあれば、単一引用符で包み、中の ' は '\'' にする.
+# 単一引用符の中では、空白・; ・$ ・` ・" ・! ・改行も、シェルは解釈しない. bash・zsh のどちらでも同じ. printf '%q' は使わない:
+# bash 3.2 は ASCII 以外のバイトを壊した形($'...')で出すため(2026-10-26 に macOS の /bin/bash で確認).
+# LC_ALL=C: ロケールによっては、不正なバイト列を sed が拒否するため.
+#   $1 = 文字列
+shell_quote() {
+	case "$1" in
+		'') printf "''" ;;
+		*[!A-Za-z0-9_/.,:@%+=-]*) printf "'%s'" "$(printf '%s' "$1" | LC_ALL=C sed "s/'/'\\\\''/g")" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
 # 同じスラッグの、タグ $2 の 1 つ前のタグの版を標準出力へ出す. 前のタグが無ければ何も出さず 1 を返す.
 #   $1 = スラッグ / $2 = 基準にするタグ名(すでにあること)
 # タグは git の version:refname の並び(1.9.0 < 1.10.0)で並べ、tag_format の {version} の前後を削って版にする.
@@ -1225,7 +1239,7 @@ print_deploy_hint() {
 	printf '展開は上書きではなく、新しいディレクトリへ展開して差し替える(新しい版で消したファイルが残らないように).\n'
 	printf '\n(ローカル)\n'
 	printf "ssh user@host 'mkdir -p ~/releases'\n"
-	printf 'scp %s user@host:~/releases/\n' "${zip_file}"
+	printf 'scp %s user@host:~/releases/\n' "$(shell_quote "${zip_file}")"
 	printf '\n(サーバー)\n'
 	printf '# unzip があるか. 無ければ、下の「unzip が無いとき」を使う\n'
 	printf 'which unzip\n'
@@ -1234,23 +1248,28 @@ print_deploy_hint() {
 	printf '# 同じディスクか. 別だと mv がコピーになり、その間ページが無くなる\n'
 	printf 'df ~/releases "$DOCROOT"\n'
 	printf 'cd ~/releases\n'
-	printf '# 新しいディレクトリへ展開する(→ ~/releases/%s/%s/)\n' "${name}" "${slug}"
-	printf 'unzip -q %s.zip -d %s\n' "${name}" "${name}"
+	printf '# 配置前の確認: 次の 3 つがすでにあれば「すでにあります」と表示される(何も出なければ、どれも無い).\n'
+	printf '# 表示されたら、ここで止める. 中身を確かめて、要らなければ消すか名前を変えてから、最初からやり直す\n'
+	printf 'for p in ~/releases/%s ~/releases/%s ~/releases/%s.failed-%s; do if [ -e "$p" ]; then echo "すでにあります: $p"; fi; done\n' "${name}" "${bak}" "${slug}" "${ver}"
+	printf '# 新しいディレクトリへ展開する(→ ~/releases/%s/%s/). mkdir は、すでにあれば失敗して、展開しない(古いファイルと混ざらない)\n' "${name}" "${slug}"
+	printf 'mkdir %s && unzip -q %s.zip -d %s\n' "${name}" "${name}" "${name}"
 	if [ "${has_version}" -eq 1 ]; then
 		printf '# 版を確かめる(%s のはず)\n' "${ver}"
 		printf 'cat %s/%s/VERSION\n' "${name}" "${slug}"
 	fi
 	printf '# 旧版を docroot の外へ退避する(初回で旧版が無いときは、この行を飛ばす)\n'
-	printf 'mv "$DOCROOT/%s" ~/releases/%s\n' "${slug}" "${bak}"
-	printf '# 新しい版を置く\n'
-	printf 'mv %s/%s "$DOCROOT/%s"\n' "${name}" "${slug}" "${slug}"
+	printf '# (退避先がすでにあると、mv は中に入れ子で入れてしまうので、ある場合は動かさない)\n'
+	printf 'if [ -e ~/releases/%s ]; then echo "すでにあります: ~/releases/%s"; else mv "$DOCROOT/%s" ~/releases/%s; fi\n' "${bak}" "${bak}" "${slug}" "${bak}"
+	printf '# 新しい版を置く(置く場所に旧版が残っていると、mv は中に入れ子で入れてしまうので、ある場合は動かさない)\n'
+	printf 'if [ -e "$DOCROOT/%s" ]; then echo "すでにあります: $DOCROOT/%s(旧版の退避に失敗していませんか)"; else mv %s/%s "$DOCROOT/%s"; fi\n' "${slug}" "${slug}" "${name}" "${slug}" "${slug}"
 	if [ "${has_version}" -eq 1 ]; then
 		printf 'cat "$DOCROOT/%s/VERSION"\n' "${slug}"
 	fi
 	printf '\n(戻すとき)\n'
-	printf 'mv "$DOCROOT/%s" ~/releases/%s.failed-%s && mv ~/releases/%s "$DOCROOT/%s"\n' "${slug}" "${slug}" "${ver}" "${bak}" "${slug}"
-	printf '\n(unzip が無いとき: 上の unzip -q の行の代わりに)\n'
-	printf "php -r '\$z=new ZipArchive;\$z->open(\$argv[1]);\$z->extractTo(\$argv[2]);' %s.zip %s\n" "${name}" "${name}"
+	printf 'if [ -e ~/releases/%s.failed-%s ]; then echo "すでにあります: ~/releases/%s.failed-%s"; else mv "$DOCROOT/%s" ~/releases/%s.failed-%s && mv ~/releases/%s "$DOCROOT/%s"; fi\n' \
+		"${slug}" "${ver}" "${slug}" "${ver}" "${slug}" "${slug}" "${ver}" "${bak}" "${slug}"
+	printf '\n(unzip が無いとき: 上の mkdir ... && unzip -q の行の代わりに)\n'
+	printf "mkdir %s && php -r '\$z=new ZipArchive;\$z->open(\$argv[1]);\$z->extractTo(\$argv[2]);' %s.zip %s\n" "${name}" "${name}" "${name}"
 	if [ "${has_version}" -eq 0 ]; then
 		err "警告: Zip に ${slug}/VERSION が入っていないので、サーバーで版を確かめる行を省きました. .distignore から VERSION を外すことを勧めます."
 	fi

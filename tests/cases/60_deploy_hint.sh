@@ -99,7 +99,7 @@ test_dir_hint_php_fallback_line_works() {
 	mk_docroot h5
 	run_tool landing; assert_rc 0
 	local line work="${TEST_ROOT}/phpx"
-	line="$(printf '%s\n' "${OUT}" | grep '^php -r')"
+	line="$(printf '%s\n' "${OUT}" | grep 'php -r')"
 	[ -n "${line}" ] || { fail "php -r の行が表示されていません"; return 0; }
 	mkdir -p "${work}" && cp "${OUTD}/landing.2.0.0.zip" "${work}/" && cd "${work}" || return 1
 	"${TOOL_BASH}" -c "${line}" >/dev/null 2>&1
@@ -113,6 +113,94 @@ test_dir_hint_omits_the_version_check_when_version_is_not_in_the_zip() {
 	assert_rc 0
 	assert_has "警告: Zip に lpx/VERSION が入っていないので"
 	assert_lacks "cat lpx.5.0.0/lpx/VERSION"
+}
+
+# 出力先に、空白・!・%・日本語があっても、scp の行がシェルに 1 つの引数として渡ること.
+# 注意: `wp dist-archive` は、出力先に ; ' " $ ( ) ` & * ? なども含むパスでは Zip を作れない(2026-10-26 に確認. 空白・!・=・,・%・日本語は通る).
+#       そのため、それらの文字での確認は、Zip を安全な一時パスで作って最終のパスへ移す対応(R5)の後に test_scp_line_quotes_shell_metacharacters で足す.
+test_scp_line_quotes_the_zip_path() {
+	need_real_wp || return 0
+	mk_docroot h9
+	local weird="${TEST_ROOT}/ou t!x=y,z%日本" fakebin="${TEST_ROOT}/fakebin" line
+	set_config "tag_format = {slug}/{version}
+output = ${weird}
+dir lp landing"
+	run_tool landing
+	assert_rc 0
+	line="$(printf '%s\n' "${OUT}" | grep '^scp ')"
+	[ -n "${line}" ] || { fail "scp の行が表示されていません"; return 0; }
+	mkdir -p "${fakebin}"
+	# 偽の scp: 1 つ目の引数(Zip のパス)をファイルに書く. $1 は、偽の scp の中で評価する.
+	# shellcheck disable=SC2016
+	printf '#!/bin/sh\nprintf "%%s" "$1" > "%s/scp-arg1"\n' "${TEST_ROOT}" > "${fakebin}/scp"
+	chmod +x "${fakebin}/scp"
+	# 表示された行を、そのままシェルで実行する(貼り付けと同じ).
+	PATH="${fakebin}:${PATH}" "${TOOL_BASH}" -c "${line}" >/dev/null 2>&1
+	assert_eq "${weird}/landing.2.0.0.zip" "$(cat "${TEST_ROOT}/scp-arg1" 2>/dev/null)" "scp に渡った Zip のパス"
+}
+
+# 疑似サーバーを作る(旧版 2.0.0 が docroot にある). 引数 = 名前. 出力: サーバーのルート.
+mk_server() {
+	local srv="${TEST_ROOT}/server-$1"
+	mkdir -p "${srv}/home/releases" "${srv}/docroot/landing" "${srv}/docroot/other"
+	printf '2.0.0\n' > "${srv}/docroot/landing/VERSION"
+	echo "old" > "${srv}/docroot/landing/index.html"
+	printf '%s' "${srv}"
+}
+
+# 表示された「(サーバー)」の手順を、疑似サーバーで実行する. 引数 = サーバーのルート・Zip.
+run_server_steps() {
+	local srv="$1" steps="${TEST_ROOT}/steps-$$.sh"
+	cp "$2" "${srv}/home/releases/"
+	extract_server_steps | sed "s#^DOCROOT=/path/to/public_html#DOCROOT=${srv}/docroot#" > "${steps}"
+	HOME="${srv}/home" "${TOOL_BASH}" "${steps}" >"${srv}/out.txt" 2>&1
+}
+
+# 配置先・退避先がすでにあるときは、何も壊さず、あると知らせること(入れ子にならない・展開先に混ざらない).
+test_server_steps_stop_when_the_places_already_exist() {
+	need_real_wp || return 0
+	mk_docroot h10
+	run_tool landing; assert_rc 0           # 2.0.0
+	release_lp 2.1.0
+	local srv
+	srv="$(mk_server s1)"
+	mkdir -p "${srv}/home/releases/landing.2.1.0" "${srv}/home/releases/landing.bak-2.0.0"
+	echo stale > "${srv}/home/releases/landing.2.1.0/stale.txt"
+	echo marker > "${srv}/home/releases/landing.bak-2.0.0/marker.txt"
+	run_server_steps "${srv}" "${OUTD}/landing.2.1.0.zip"
+	grep -q "すでにあります: " "${srv}/out.txt" || fail "あることを知らせていません: $(cat "${srv}/out.txt")"
+	assert_eq "2.0.0" "$(cat "${srv}/docroot/landing/VERSION")" "docroot の版(差し替えない)"
+	assert_no_file "${srv}/home/releases/landing.2.1.0/landing"          # 展開先に混ざらない
+	assert_file "${srv}/home/releases/landing.2.1.0/stale.txt"
+	assert_no_file "${srv}/home/releases/landing.bak-2.0.0/landing"      # 退避先の中に入れ子にならない
+	assert_file "${srv}/home/releases/landing.bak-2.0.0/marker.txt"
+}
+
+# 退避先(.failed-<版>)がすでにあるとき、戻すコマンドは何も動かさないこと.
+test_rollback_stops_when_the_failed_place_exists() {
+	need_real_wp || return 0
+	mk_docroot h11
+	run_tool landing; assert_rc 0           # 2.0.0
+	release_lp 2.1.0
+	local srv rollback
+	srv="$(mk_server s2)"
+	run_server_steps "${srv}" "${OUTD}/landing.2.1.0.zip"
+	assert_eq "2.1.0" "$(cat "${srv}/docroot/landing/VERSION")" "差し替え後の版(前提)"
+	mkdir -p "${srv}/home/releases/landing.failed-2.1.0" && echo marker > "${srv}/home/releases/landing.failed-2.1.0/marker.txt"
+	rollback="$(extract_rollback)"
+	HOME="${srv}/home" DOCROOT="${srv}/docroot" "${TOOL_BASH}" -c "${rollback}" >"${srv}/rb.txt" 2>&1
+	grep -q "すでにあります: " "${srv}/rb.txt" || fail "あることを知らせていません: $(cat "${srv}/rb.txt")"
+	assert_eq "2.1.0" "$(cat "${srv}/docroot/landing/VERSION")" "戻していない(docroot はそのまま)"
+	assert_no_file "${srv}/home/releases/landing.failed-2.1.0/landing"   # 入れ子にならない
+}
+
+# 表示に、配置前の確認の行(3 つの名前)があること.
+test_server_steps_begin_with_an_existence_check() {
+	need_real_wp || return 0
+	mk_docroot h12
+	run_tool landing; assert_rc 0
+	release_lp 2.1.0
+	assert_has "landing.2.1.0 ~/releases/landing.bak-2.0.0 ~/releases/landing.failed-2.1.0"
 }
 
 test_dry_run_prints_no_hint() {
