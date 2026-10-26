@@ -214,6 +214,27 @@ test_fingerprint_changes_with_content_name_and_mode() {
 	[ "${base}" != "${v}" ] || fail "実行権限が違うのに、指紋が同じです"
 }
 
+# 作り直すときの wp dist-archive(や zip)が、元と違う内容を作ったとき(版違いで、入るファイルが変わる場合を想定)、止めること.
+# 偽の wp が、本物の wp dist-archive の出力に、元には無かったファイルを足す.
+test_rebuild_stops_when_the_builder_produces_different_content() {
+	need_real_wp || return 0
+	mk_docroot r9
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	local real fake
+	real="$(command -v wp)"
+	# mktemp は使わない(出力先の Zip と同じディレクトリの下に、作業用のディレクトリを作る).
+	fake="$(make_fake_wp differ "'${real}' \"\$@\" || exit \$?; d=\"\$(dirname \"\$3\")/work\$\$\" && mkdir -p \"\$d/my-plugin\" && echo extra > \"\$d/my-plugin/extra.txt\" && (cd \"\$d\" && zip -q \"\$3\" my-plugin/extra.txt); rm -rf \"\$d\"")"
+	LABEL="止める"; run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin --rebuild
+	assert_rc 1
+	assert_has "内容の指紋が、タグの記録と違います"
+	assert_has "--allow-content-change"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	LABEL="許可する"; run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin --rebuild --allow-content-change
+	assert_rc 0
+	zip_has "${OUTD}/my-plugin.1.2.3.zip" "my-plugin/extra.txt" || fail "足したファイルが入っていません(テストの前提)"
+}
+
 test_rebuild_without_a_recorded_fingerprint() {
 	need_real_wp || return 0
 	mk_docroot r6

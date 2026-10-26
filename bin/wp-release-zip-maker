@@ -818,7 +818,7 @@ warn_non_ascii_names() {
 # 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること・配布してはいけないファイルが無いこと. unzip が無ければ確認を省く.
 #   $1 = スラッグ / $2 = Zip のパス / $3 = 種類(plugin・theme・dir)
 verify_zip() {
-	local slug="$1" zip_file="$2" kind="$3" found stops warns n
+	local slug="$1" zip_file="$2" kind="$3" found stops warns n escapes
 	if ! command -v unzip >/dev/null 2>&1; then
 		err "警告: unzip が無いので、Zip の中身の確認(スラッグのフォルダー・配布してはいけないファイルの検査)を省きました. 中身を自分で確かめてから使ってください."
 		return 0
@@ -828,6 +828,16 @@ verify_zip() {
 	if ! unzip -Z1 "${zip_file}" | LC_ALL=C awk -v s="${slug}/" 'index($0, s) != 1 { bad = 1 } END { exit bad ? 1 : 0 }'; then
 		rm -f -- "${zip_file}"
 		die "Zip の中に、${slug}/ の外のファイルがあります(Zip は消しました). dist-archive の動作が想定と違います."
+	fi
+
+	# 'slug/../x' のように、スラッグのフォルダーの外へ出る名前(部品が '..' のもの)があれば止める.
+	# 上の前方一致は 'slug/' で始まれば通すので、'slug/../evil' はすり抜ける. 展開する側(WordPress・unzip)が弾くかどうかに頼らない.
+	escapes="$(unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '{ for (i = 1; i <= NF; i++) if ($i == "..") { print; next } }')"
+	if [ -n "${escapes}" ]; then
+		rm -f -- "${zip_file}"
+		err "${PROG}: Zip の中に、スラッグのフォルダーの外へ出る名前(.. を含むパス)があります(Zip は消しました):"
+		printf '%s\n' "${escapes}" | head -n 20 | sed 's/^/  /' >&2
+		exit "${EXIT_STOP}"
 	fi
 
 	# 配布してはいけないファイル(止める)と、ドットで始まるファイル(警告). 判定は scan_zip_names の説明を参照.
@@ -1298,28 +1308,32 @@ print_deploy_hint() {
 	printf '# 同じディスクか. 別だと mv がコピーになり、その間ページが無くなる\n'
 	printf 'df ~/releases "$DOCROOT"\n'
 	printf 'cd ~/releases\n'
-	printf '# 配置前の確認: 次の 3 つがすでにあれば「すでにあります」と表示される(何も出なければ、どれも無い).\n'
+	printf '# 配置前の確認: 次の 4 つがすでにあれば「すでにあります」と表示される(何も出なければ、どれも無い).\n'
 	printf '# 表示されたら、ここで止める. 中身を確かめて、要らなければ消すか名前を変えてから、最初からやり直す\n'
-	printf 'for p in ~/releases/%s ~/releases/%s ~/releases/%s.failed-%s; do if [ -e "$p" ]; then echo "すでにあります: $p"; fi; done\n' "${name}" "${bak}" "${slug}" "${ver}"
-	printf '# 新しいディレクトリへ展開する(→ ~/releases/%s/%s/). mkdir は、すでにあれば失敗して、展開しない(古いファイルと混ざらない)\n' "${name}" "${slug}"
-	printf 'mkdir %s && unzip -q %s.zip -d %s\n' "${name}" "${name}" "${name}"
+	printf 'for p in ~/releases/%s ~/releases/%s.partial ~/releases/%s ~/releases/%s.failed-%s; do if [ -e "$p" ]; then echo "すでにあります: $p"; fi; done\n' "${name}" "${name}" "${bak}" "${slug}" "${ver}"
+	printf '# 新しいディレクトリへ展開する(→ ~/releases/%s/%s/). まず %s.partial へ展開し、全部成功したときだけ %s に名前を変える\n' "${name}" "${slug}" "${name}" "${name}"
+	printf '# (途中で失敗した展開を、本物の名前にしない. 成功したときだけ EXTRACTED=1 になり、下の退避・差し替えは、それを見て動く)\n'
+	printf 'EXTRACTED=\n'
+	printf 'if [ -e %s ]; then echo "すでにあります: ~/releases/%s"; else mkdir %s.partial && unzip -q %s.zip -d %s.partial && mv %s.partial %s && EXTRACTED=1; fi\n' \
+		"${name}" "${name}" "${name}" "${name}" "${name}" "${name}" "${name}"
 	if [ "${has_version}" -eq 1 ]; then
 		printf '# 版を確かめる(%s のはず)\n' "${ver}"
 		printf 'cat %s/%s/VERSION\n' "${name}" "${slug}"
 	fi
 	printf '# 旧版を docroot の外へ退避する(初回で旧版が無いときは、この行を飛ばす)\n'
-	printf '# (退避先がすでにあると、mv は中に入れ子で入れてしまうので、ある場合は動かさない)\n'
-	printf 'if [ -e ~/releases/%s ]; then echo "すでにあります: ~/releases/%s"; else mv "$DOCROOT/%s" ~/releases/%s; fi\n' "${bak}" "${bak}" "${slug}" "${bak}"
-	printf '# 新しい版を置く(置く場所に旧版が残っていると、mv は中に入れ子で入れてしまうので、ある場合は動かさない)\n'
-	printf 'if [ -e "$DOCROOT/%s" ]; then echo "すでにあります: $DOCROOT/%s(旧版の退避に失敗していませんか)"; else mv %s/%s "$DOCROOT/%s"; fi\n' "${slug}" "${slug}" "${name}" "${slug}" "${slug}"
+	printf '# (展開が済んでいなければ動かさない. 退避先がすでにあると、mv は中に入れ子で入れてしまうので、ある場合も動かさない)\n'
+	printf 'if [ -z "$EXTRACTED" ]; then echo "展開が済んでいないので、動かしません"; elif [ -e ~/releases/%s ]; then echo "すでにあります: ~/releases/%s"; else mv "$DOCROOT/%s" ~/releases/%s; fi\n' "${bak}" "${bak}" "${slug}" "${bak}"
+	printf '# 新しい版を置く(展開が済んでいなければ動かさない. 置く場所に旧版が残っていると、mv は中に入れ子で入れてしまうので、ある場合も動かさない)\n'
+	printf 'if [ -z "$EXTRACTED" ]; then echo "展開が済んでいないので、動かしません"; elif [ -e "$DOCROOT/%s" ]; then echo "すでにあります: $DOCROOT/%s(旧版の退避に失敗していませんか)"; else mv %s/%s "$DOCROOT/%s"; fi\n' "${slug}" "${slug}" "${name}" "${slug}" "${slug}"
 	if [ "${has_version}" -eq 1 ]; then
 		printf 'cat "$DOCROOT/%s/VERSION"\n' "${slug}"
 	fi
 	printf '\n(戻すとき)\n'
 	printf 'if [ -e ~/releases/%s.failed-%s ]; then echo "すでにあります: ~/releases/%s.failed-%s"; else mv "$DOCROOT/%s" ~/releases/%s.failed-%s && mv ~/releases/%s "$DOCROOT/%s"; fi\n' \
 		"${slug}" "${ver}" "${slug}" "${ver}" "${slug}" "${slug}" "${ver}" "${bak}" "${slug}"
-	printf '\n(unzip が無いとき: 上の mkdir ... && unzip -q の行の代わりに)\n'
-	printf "mkdir %s && php -r '\$z=new ZipArchive;\$z->open(\$argv[1]);\$z->extractTo(\$argv[2]);' %s.zip %s\n" "${name}" "${name}" "${name}"
+	printf '\n(unzip が無いとき: 上の「if [ -e %s ]」の行の代わりに)\n' "${name}"
+	printf "if [ -e %s ]; then echo \"すでにあります: ~/releases/%s\"; else mkdir %s.partial && php -r '\$z=new ZipArchive; if (\$z->open(\$argv[1]) !== true || !\$z->extractTo(\$argv[2])) exit(1);' %s.zip %s.partial && mv %s.partial %s && EXTRACTED=1; fi\n" \
+		"${name}" "${name}" "${name}" "${name}" "${name}" "${name}" "${name}"
 	if [ "${has_version}" -eq 0 ]; then
 		err "警告: Zip に ${slug}/VERSION が入っていないので、サーバーで版を確かめる行を省きました. .distignore から VERSION を外すことを勧めます."
 	fi

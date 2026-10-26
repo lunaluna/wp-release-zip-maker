@@ -246,6 +246,22 @@ test_htaccess_and_well_known_are_fine_in_a_dir() {
 	assert_has "landing/.gitkeep"
 }
 
+# Zip の中に、スラッグのフォルダーの外へ出る名前(slug/../x)があれば、止めて Zip を消すこと.
+# 展開する側(WordPress・unzip)の実装に頼らず、ツールが配る前に弾く. 偽の wp が、そのような名前の入った Zip を作る(python3 が要る).
+test_path_traversal_entry_in_the_zip_stops() {
+	need_real_wp || return 0
+	command -v python3 >/dev/null 2>&1 || { skip "python3 が無い(不正な名前の入った Zip を作れない)"; return 0; }
+	mk_docroot e6
+	local fake
+	fake="$(make_fake_wp traversal 'mkdir -p "$(dirname "$3")"; python3 -c '"'"'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1],"w"); z.writestr("my-plugin/a.php","x"); z.writestr("my-plugin/../evil.txt","x"); z.close()'"'"' "$3"; echo "Success: fake"')"
+	run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin
+	assert_rc 1
+	assert_has "スラッグのフォルダーの外へ出る名前"
+	assert_has "my-plugin/../evil.txt"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+}
+
 # --- 出力 Zip の排他(上書きしない) --------------------------------------------------------------
 
 # 出力先に、壊れたシンボリックリンク(行き先が無い)が同名であれば、その先へ書かず、すでにあるものとして止めること.

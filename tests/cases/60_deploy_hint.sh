@@ -215,7 +215,30 @@ test_server_steps_begin_with_an_existence_check() {
 	mk_docroot h12
 	run_tool landing; assert_rc 0
 	release_lp 2.1.0
-	assert_has "landing.2.1.0 ~/releases/landing.bak-2.0.0 ~/releases/landing.failed-2.1.0"
+	# shellcheck disable=SC2088  # 表示される文字列の ~ をそのまま探す(展開しない)
+	assert_has "~/releases/landing.2.1.0 ~/releases/landing.2.1.0.partial ~/releases/landing.bak-2.0.0 ~/releases/landing.failed-2.1.0"
+}
+
+# unzip が失敗した(Zip が壊れている・途中で切れた)とき、docroot の旧版を動かさないこと.
+# 以前の手順は、展開に失敗しても退避の mv を実行し、docroot から旧版が消えたまま新しい版も置けない状態になりえた.
+test_server_steps_do_not_touch_the_docroot_when_unzip_fails() {
+	need_real_wp || return 0
+	mk_docroot h14
+	run_tool landing; assert_rc 0           # 2.0.0
+	release_lp 2.1.0
+	local srv
+	srv="$(mk_server s3)"
+	echo "other" > "${srv}/docroot/other/keep.txt"
+	# 壊れた Zip(先頭の一部だけ)を置く.
+	head -c 300 "${OUTD}/landing.2.1.0.zip" > "${TEST_ROOT}/broken.zip"
+	cp "${TEST_ROOT}/broken.zip" "${TEST_ROOT}/landing.2.1.0.zip"
+	run_server_steps "${srv}" "${TEST_ROOT}/landing.2.1.0.zip"
+	grep -q "展開が済んでいない" "${srv}/out.txt" || fail "展開の失敗を知らせていません: $(cat "${srv}/out.txt")"
+	assert_eq "2.0.0" "$(cat "${srv}/docroot/landing/VERSION")" "docroot の版(動かさない)"
+	assert_eq "old" "$(cat "${srv}/docroot/landing/index.html")" "docroot の index.html"
+	assert_no_file "${srv}/home/releases/landing.bak-2.0.0"            # 退避もしない
+	assert_no_file "${srv}/home/releases/landing.2.1.0"                # 中途半端な展開先を、本物の名前にしない
+	assert_file "${srv}/docroot/other/keep.txt"
 }
 
 test_dry_run_prints_no_hint() {
