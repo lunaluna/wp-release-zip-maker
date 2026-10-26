@@ -67,6 +67,8 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
 使い方:
   ${PROG} <slug>
       HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない)
+  ${PROG} <slug> --sign
+      署名付きのタグ(git tag -s)を打つ. gpg と鍵が要る. 署名できなければ、タグも Zip も作らない
   ${PROG} <slug> --dry-run
       確認だけ(Zip もタグも作らない)
   ${PROG} <slug> [--rebuild [<版>]] --manifest
@@ -1006,13 +1008,16 @@ check_git_identity() {
 }
 
 # 注釈付きタグを打つ. 打てなければ非 0 を返す(Zip の後始末は呼び出し側).
-#   $1 = タグ名 / $2 = コミット / $3 = スラッグ / $4 = 版 / $5 = Zip のパス
+#   $1 = タグ名 / $2 = コミット / $3 = スラッグ / $4 = 版 / $5 = Zip のパス / $6 = 1 なら署名付き(git tag -s. --sign)
+# 署名は Git と gpg に任せる(このツールは鍵を扱わない). 署名できなければタグは打たれず、非 0 を返す(呼び出し側が Zip を消す).
+# --sign なしでも、利用者が git config tag.gpgSign true にしていれば、Git が署名する(git tag -a の仕様).
 # メッセージ: 1 行目 = '<スラッグ> <版>'. 本文 = Zip の名前・SHA-256・内容の指紋・ツールの版・Zip を作った道具(WP-CLI・dist-archive・zip)の版.
 #   SHA-256         = 配布した Zip そのもの(バイト列)の SHA-256. 手元の Zip が配布したものと同じかを確かめるための記録.
 #   Content-SHA-256 = Zip の内容の指紋(zip_content_digest). --rebuild が、作り直した Zip の内容と比べる.
 #                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. unzip が無ければこの行は書かない.
 create_tag() {
-	local tag="$1" commit="$2" slug="$3" ver="$4" zip_file="$5" content
+	local tag="$1" commit="$2" slug="$3" ver="$4" zip_file="$5" sign="${6:-0}" content tagopt="-a"
+	[ "${sign}" -eq 0 ] || tagopt="-s"
 	content="$(zip_content_digest "${zip_file}")" || content=""
 	{
 		printf '%s %s\n\nZip: %s\nSHA-256: %s\n' "${slug}" "${ver}" "$(basename "${zip_file}")" "$(sha256_of "${zip_file}")"
@@ -1021,7 +1026,7 @@ create_tag() {
 		printf 'WP-CLI: %s\n' "$(wp_cli_version)"
 		printf 'dist-archive: %s\n' "$(dist_archive_version)"
 		printf 'zip: %s\n' "$(zip_version)"
-	} | git -C "${GIT_TOP}" tag -a -F - "${tag}" "${commit}"
+	} | git -C "${GIT_TOP}" tag "${tagopt}" -F - "${tag}" "${commit}"
 }
 
 # タグのメッセージに記録された値を標準出力へ出す(無ければ何も出さない). $1 = タグ名 / $2 = 見出し('SHA-256' など).
@@ -1073,6 +1078,7 @@ read_version_at() {
 # 3 つの動作の事前の確認と実行.
 #   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
 #   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
+#   $7 = 1 なら、署名付きのタグを打つ(--sign. 通常の実行だけ)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1080,7 +1086,7 @@ read_version_at() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" manifest_file=""
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1232,6 +1238,7 @@ cmd_build() {
 		fi
 		printf 'Zip:        %s\n' "${zip_file}"
 		[ "${manifest}" -eq 0 ] || printf 'マニフェスト: %s\n' "${manifest_file}"
+		[ "${sign}" -eq 0 ] || printf '署名:       する(git tag -s. gpg と鍵が要ります. 署名できなければ、タグも Zip も作りません)\n'
 		return 0
 	fi
 
@@ -1257,14 +1264,14 @@ cmd_build() {
 	if [ "${manifest}" -eq 1 ]; then
 		write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました). unzip があるか確かめてください."; }
 	fi
-	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}"; then
+	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}" "${sign}"; then
 		rm -f -- "${zip_file}"
 		[ "${manifest}" -eq 0 ] || rm -f -- "${manifest_file}"
-		die "タグ ${tag} を打てませんでした(Zip は消しました). Git のエラーを確かめてから、もう一度実行してください."
+		die "タグ ${tag} を打てませんでした(Zip は消しました). Git のエラーを確かめてから、もう一度実行してください.$([ "${sign}" -eq 0 ] || printf '\n  --sign: gpg が使えるか(gpg --list-secret-keys)・署名する鍵(git config user.signingkey)・パスフレーズの入力(pinentry)を確かめてください.')"
 	fi
 	printf '\n'
 	print_zip_summary "${slug}" "${zip_file}"
-	printf '\nタグ:       %s を打ちました(注釈付き・コミット %s).\n' "${tag}" "${short}"
+	printf '\nタグ:       %s を打ちました(注釈付き%s・コミット %s).\n' "${tag}" "$([ "${sign}" -eq 0 ] || printf '・署名付き')" "${short}"
 	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
 	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 }
@@ -1485,7 +1492,7 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
@@ -1493,6 +1500,7 @@ main() {
 			--rebuild) rebuild=1 ;;
 			--allow-content-change) allow_change=1 ;;
 			--manifest) manifest=1 ;;
+			--sign) sign=1 ;;
 			-*)
 				err "${PROG}: 不明なオプション '$1'"
 				err "'${PROG} --help' で使い方を確認してください."
@@ -1514,7 +1522,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1538,7 +1546,13 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}"
+	# 署名するのは、タグを打つ通常の実行だけ. --rebuild はタグを打たない.
+	if [ "${sign}" -eq 1 ] && [ "${rebuild}" -eq 1 ]; then
+		err "${PROG}: --sign は、タグを打つ通常の実行でだけ指定できます(--rebuild はタグを打ちません)."
+		exit "${EXIT_USAGE}"
+	fi
+
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}"
 }
 
 main "$@"

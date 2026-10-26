@@ -78,6 +78,59 @@ test_tag_failure_removes_the_zip() {
 	assert_eq "0" "$(leftover_tmp_count)" "取り残された一時ディレクトリの数"
 }
 
+# --- 署名付きタグ(--sign) -----------------------------------------------------------------------
+# この環境には gpg が無く、実際の署名はテストできない. 代わりに、Git が期待する形(署名を標準出力・状態を標準エラーの [GNUPG:] SIG_CREATED)を返す偽の gpg を使い、
+# ツールが「git tag -s で打つ」ことと、失敗したときの後始末を確かめる(署名そのものの正しさは Git と gpg の責任).
+
+# 偽の gpg を作る. 出力: そのパス.
+make_fake_gpg() {
+	local path="${TEST_ROOT}/fake-gpg"
+	printf '#!/bin/sh\ncat > /dev/null\necho "-----BEGIN PGP SIGNATURE-----"\necho "ZmFrZQ=="\necho "-----END PGP SIGNATURE-----"\necho "[GNUPG:] SIG_CREATED D 1 8 00 0 FAKE" >&2\n' > "${path}"
+	chmod +x "${path}"
+	printf '%s' "${path}"
+}
+
+# --sign で、署名付きのタグが打たれること. 付けなければ、署名されないこと(gpg.program を指していても).
+test_sign_makes_a_signed_tag() {
+	need_real_wp || return 0
+	mk_docroot g1
+	local gpg
+	gpg="$(make_fake_gpg)"
+	run_tool_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=gpg.program "GIT_CONFIG_VALUE_0=${gpg}" -- my-plugin --sign
+	assert_rc 0
+	git cat-file -p my-plugin/1.2.3 | grep -q 'BEGIN PGP SIGNATURE' || fail "タグに署名がありません"
+	assert_eq "my-plugin 1.2.3" "$(git tag -l --format='%(contents:subject)' my-plugin/1.2.3)" "タグの 1 行目(署名があっても同じ)"
+	assert_has "署名付き"
+	mk_docroot g2
+	LABEL="付けない"; run_tool_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=gpg.program "GIT_CONFIG_VALUE_0=${gpg}" -- my-plugin
+	assert_rc 0
+	git cat-file -p my-plugin/1.2.3 | grep -q 'BEGIN PGP SIGNATURE' && fail "--sign なしなのに、署名されています"
+	assert_lacks "署名付き"
+}
+
+# 署名に失敗したら(gpg が無い・鍵が無い・パスフレーズの入力に失敗など)、タグも Zip も作らないこと.
+test_sign_failure_removes_everything() {
+	need_real_wp || return 0
+	mk_docroot g3
+	run_tool_env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=gpg.program "GIT_CONFIG_VALUE_0=$(command -v false)" -- my-plugin --sign --manifest
+	assert_rc 1
+	assert_has "を打てませんでした(Zip は消しました)"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	assert_eq "" "$(git tag)" "打たれたタグ"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残された一時ディレクトリの数"
+}
+
+# --sign は、タグを打つときだけ指定できる(--rebuild・--list では誤り). --dry-run では、署名する予定だと表示する.
+test_sign_option_usage() {
+	need_real_wp || return 0
+	mk_docroot g4
+	LABEL="--rebuild"; run_tool my-plugin --rebuild --sign; assert_rc 2; assert_has "--sign は"
+	LABEL="--list"; run_tool --list --sign; assert_rc 2; assert_has "--list には"
+	LABEL="--dry-run"; run_tool my-plugin --sign --dry-run; assert_rc 0; assert_has "署名:"
+	assert_no_file "${OUTD}"
+}
+
 # --- --rebuild -----------------------------------------------------------------------------------
 
 test_rebuild_reproduces_the_content_without_a_new_tag() {
