@@ -1391,13 +1391,15 @@ previous_version() {
 # 作った(作り直した)Zip を、サーバーへ上げる手順を表示する.
 #   $1 = 種類 / $2 = スラッグ / $3 = 版 / $4 = タグ名 / $5 = Zip のパス
 # theme・plugin は管理画面の Zip アップロード. dir は SSH(scp + unzip + mv)の手順を、版とパスを埋めて出す.
+# 管理画面のメニュー名は WordPress 7.1 の日本語の表記に合わせる(admin-ja.po の "Add Plugin" = プラグインを追加・
+# "Add Theme" = テーマを追加・"Upload Plugin" / "Upload Theme" = プラグイン / テーマのアップロード).
 # shellcheck disable=SC2016  # 表示する手順の中の $DOCROOT と $z などは、展開せずにそのまま出す(サーバーで展開される).
 print_deploy_hint() {
 	local kind="$1" slug="$2" ver="$3" tag="$4" zip_file="$5" prev bak has_version name
 	case "${kind}" in
 		theme | plugin)
 			printf '\nアップロード: 管理画面の「%s」から、この Zip(%s)を上げます.\n' \
-				"$([ "${kind}" = "theme" ] && echo 'テーマの追加 > テーマのアップロード' || echo 'プラグインの追加 > プラグインのアップロード')" "$(basename "${zip_file}")"
+				"$([ "${kind}" = "theme" ] && echo '外観 > テーマ > テーマを追加 > テーマのアップロード' || echo 'プラグイン > プラグインを追加 > プラグインのアップロード')" "$(basename "${zip_file}")"
 			printf '            Zip の一番上のフォルダー(%s)が、置き換わる対象を決めます.\n' "${slug}"
 			return 0
 			;;
