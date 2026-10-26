@@ -96,7 +96,7 @@ wp-release-zip-maker --version / --help
 ```text
 tag_format = {slug}/{version}        # 省略可。対象が 1 つなら {version}、複数なら {slug}/{version}
 output     = ../releases             # 必須。設定ファイルからの相対パス。Git と docroot の外を推奨
-requires   = 0.1.0                   # 省略可。このツールの最低の版。古ければ止める
+requires   = 1.0.0                   # 省略可。このツールの最低の版。古ければ止める
 
 # 種類    パス(設定ファイルからの相対)    スラッグ(省略時はディレクトリ名)
 plugin   wp-content/plugins/my-plugin
@@ -197,7 +197,7 @@ my-plugin 1.2.3
 Zip: my-plugin.1.2.3.zip
 SHA-256: <配布した Zip そのもの(バイト列)の SHA-256>
 Content-SHA-256: <Zip の内容の指紋>
-Built-with: wp-release-zip-maker 0.1.0
+Built-with: wp-release-zip-maker 1.0.0
 WP-CLI: 2.12.0
 dist-archive: 3.1.0
 zip: 3.0

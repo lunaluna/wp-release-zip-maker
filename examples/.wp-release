@@ -10,7 +10,7 @@ tag_format = {slug}/{version}
 output     = ../releases
 
 # このツールの最低の版. 古ければ止める(任意).
-requires   = 0.1.0
+requires   = 1.0.0
 
 # 対象: 種類(plugin / theme / dir)  パス(設定ファイルからの相対)  スラッグ(省略時はディレクトリ名)
 plugin   wp-content/plugins/my-plugin
