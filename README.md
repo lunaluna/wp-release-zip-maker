@@ -3,30 +3,73 @@
 GitHub の Release を使えないプロジェクト(クライアントワークなど)でも、テーマ・プラグイン・
 WordPress の外のディレクトリの配布用 Zip を、**ローカルで・版を管理しながら**作るコマンドです。
 
-> **開発中(0.1.0)**: 主な機能とテストは揃っています(`--list`・`--dry-run`・Zip の作成・注釈付きタグ・`--rebuild`・アップロード手順の表示)。
-> README の仕上げと 1.0.0 のリリースが残っています。
-
 ## 何をするか
 
 - サーバーでは Git を使いません。テーマ・プラグインは管理画面の Zip アップロード、ディレクトリは SSH で上げて unzip します
 - 1 つのリポジトリにテーマとプラグインなど複数のものが入っていても、それぞれの Zip を作れます
 - Zip の作成は WP-CLI の公式パッケージ `wp dist-archive` に任せます。このツールは git と版の管理を担う薄いラッパーです
-- 版のタグは素の版番号です(`v` を付けません)
+- 版のタグは素の版番号です(`v` を付けません)。Zip は HEAD(または既存のタグ)のコミットから作るので、作業ツリーの途中の状態が混ざりません
+- 事前に、止めるべき状態(作業ツリーが汚れている・版の表記がそろっていない・タグや Zip がすでにある、など)を確かめ、理由を示して止めます
+
+### このツールがしないこと
+
+- `git push` はしません(タグを共有するコマンドを表示するだけです)
+- サーバーへのアップロードはしません(手順を表示するだけです)
+- 版の書かれたファイルを書き換えません(版は、あなたが上げてコミットします。このツールは読んで確かめるだけです)
+- GitHub の Release は作りません
+- WordPress・データベースには接続しません。ネットワークにも接続しません(`git` と `wp` を呼ぶだけです)
+- Zip を上書きしません(すでにあれば止めます)
 
 ## 必要なもの
 
-- bash(macOS 標準の 3.2 で動く書き方にします)
+- bash(macOS 標準の 3.2 で動きます)
 - git・`zip`
 - WP-CLI と、そのパッケージ `wp-cli/dist-archive-command`
+- (任意)`unzip`: Zip の中身の確認・内容の指紋・サマリーの内訳に使います。無ければ、その確認を省いて警告します
 
 `wp dist-archive` の入れ方は、WP-CLI の版によって変わります。
 
 ```bash
-wp package install wp-cli/dist-archive-command:3.1.0   # WP-CLI 2.12.x
+wp package install wp-cli/dist-archive-command:3.1.0   # WP-CLI 2.12.x(この版で確かめた)
 ```
 
 版を指定せずに入れると、WP-CLI 2.12.x では失敗します(最新版が WP-CLI 3.0 以上を要求するため)。
-WP-CLI 2.13 以上なら、`v3.2.x` も入ります。
+WP-CLI 2.13 以上では、版を指定せずに入れられる見込みですが、**未確認**です(2.12.0 でだけ確かめました)。
+
+## インストール(Mac に 1 回だけ)
+
+プロジェクトにツールのコードは入れません。clone して、PATH の通ったところへシンボリックリンクを張ります。
+
+```bash
+git clone https://github.com/lunaluna/wp-release-zip-maker.git ~/private/wp-release-zip-maker   # 置き場所は自由
+mkdir -p ~/.local/bin
+ln -s ~/private/wp-release-zip-maker/bin/wp-release-zip-maker ~/.local/bin/wp-release-zip-maker
+wp-release-zip-maker --version      # 版が出れば、PATH が通っています
+```
+
+更新は、clone したディレクトリで `git pull` します。プロジェクトに置くのは、設定ファイル `.wp-release` と、各対象の `.distignore` だけです。
+
+## クイックスタート
+
+1. Git のルートに、設定ファイル `.wp-release` を置く(見本: [examples/](examples/))
+2. 配布する各ディレクトリに、Zip に入れないものを書いた `.distignore` を置いて、コミットする
+   (`wp dist-archive` は `.distignore` が無いと、`node_modules` や `src` も含む全ファイルを入れるため、無ければ止めます)
+
+   ```text
+   .distignore
+   .git
+   .gitignore
+   node_modules
+   src
+   package.json
+   package-lock.json
+   ```
+
+3. `wp-release-zip-maker --list` で、対象と版・タグの有無を確かめる
+4. 版を上げてコミットする(版の表記を複数のファイルに持つなら、`check` の行で、そろっているか確かめられます)
+5. `wp-release-zip-maker <slug> --dry-run` で確認し、`wp-release-zip-maker <slug>` で Zip とタグを作る
+6. 必要なら、タグを共有する(`git push <リモート名> <タグ>`)
+7. 表示された手順で、Zip をサーバーへ上げる
 
 ## 使い方
 
@@ -68,6 +111,8 @@ check    wp-content/plugins/my-plugin/package.json:"version"
 - `check` は、そのパスを含む対象(`plugin`/`theme`/`dir` のディレクトリの下)の確認にだけ使います。
   たとえばプラグインとテーマの両方が入る設定で、プラグインの Zip を作るときに、テーマの `package.json` とは比べません。
   どの対象の下にもない `check` は、書き間違いとして止めます
+
+## 動作の詳細
 
 ### 事前の確認(`<slug> --dry-run`)
 
