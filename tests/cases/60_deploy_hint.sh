@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# アップロード手順の表示のテスト(実物の `wp dist-archive` と zip・unzip が要る. 無ければ SKIP).
+# dir の SSH の手順は、表示されたコマンドを疑似サーバー(別ディレクトリ・偽の HOME)で実際に実行して確かめる.
+# shellcheck disable=SC2329,SC2317  # test_ で始まる関数は、tests_main が名前で呼ぶ(shellcheck には呼び出しが見えない)
+# shellcheck source=../lib.sh
+source "$(dirname "$0")/../lib.sh"
+
+need_real_wp() {
+	if have_dist_archive; then
+		return 0
+	fi
+	skip "実物の wp dist-archive・zip・unzip が無い"
+	return 1
+}
+
+# lp(スラッグ landing)を、版 $1 に上げてコミットし、Zip を作る(タグも打たれる).
+release_lp() {
+	bump_lp "$1"
+	run_tool landing
+	assert_rc 0
+}
+
+# OUT(ツールの出力)から、「(サーバー)」から「(戻すとき)」の手前までを取り出す.
+extract_server_steps() {
+	printf '%s\n' "${OUT}" | awk '/^\(サーバー\)/{f=1;next} /^\(戻すとき\)/{f=0} f && NF'
+}
+
+# OUT から、「(戻すとき)」のコマンドを取り出す.
+extract_rollback() {
+	printf '%s\n' "${OUT}" | awk '/^\(戻すとき\)/{f=1;next} /^$/{f=0} f && NF'
+}
+
+test_plugin_and_theme_get_the_admin_upload_hint() {
+	need_real_wp || return 0
+	mk_docroot h1
+	LABEL="plugin"; run_tool my-plugin; assert_rc 0; assert_has "プラグインの追加 > プラグインのアップロード"; assert_lacks "scp "
+	LABEL="theme"; run_tool my-theme; assert_rc 0; assert_has "テーマの追加 > テーマのアップロード"
+}
+
+test_dir_hint_for_the_first_release() {
+	need_real_wp || return 0
+	mk_docroot h2
+	run_tool landing
+	assert_rc 0
+	assert_has "scp ${OUTD}/landing.2.0.0.zip user@host:~/releases/"
+	assert_has "mv \"\$DOCROOT/landing\" ~/releases/landing.bak"
+	assert_has "メモ: 同じスラッグの前のタグが無い"
+	assert_has "unzip -q landing.2.0.0.zip -d landing.2.0.0"
+}
+
+test_dir_hint_names_the_previous_version_in_version_order() {
+	need_real_wp || return 0
+	mk_docroot h3
+	run_tool landing; assert_rc 0           # 2.0.0
+	release_lp 2.1.0
+	release_lp 2.9.0
+	release_lp 2.10.0
+	# 文字列順だと 2.10.0 は 2.1.0 の次になる. 数の並びなら 2.9.0 の次.
+	assert_has "landing.bak-2.9.0"
+	assert_lacks "landing.bak-2.1.0"
+	assert_has "landing.failed-2.10.0"
+}
+
+test_dir_hint_commands_work_on_a_simulated_server() {
+	need_real_wp || return 0
+	mk_docroot h4
+	run_tool landing; assert_rc 0           # 2.0.0
+	release_lp 2.1.0                        # OUT は 2.1.0 の出力(前の版は 2.0.0)
+	local srv="${TEST_ROOT}/server" steps rollback
+	mkdir -p "${srv}/home/releases" "${srv}/docroot/landing" "${srv}/docroot/other"
+	# 旧版(2.0.0): 新しい版にはないファイルを持つ.
+	printf '2.0.0\n' > "${srv}/docroot/landing/VERSION"
+	echo "old" > "${srv}/docroot/landing/index.html"
+	echo "旧版にだけあるファイル" > "${srv}/docroot/landing/removed-later.txt"
+	echo "keep" > "${srv}/docroot/other/keep.txt"
+	cp "${OUTD}/landing.2.1.0.zip" "${srv}/home/releases/"   # scp の代わり
+	steps="${TEST_ROOT}/server-steps.sh"
+	extract_server_steps | sed "s#^DOCROOT=/path/to/public_html#DOCROOT=${srv}/docroot#" > "${steps}"
+	grep -q "^DOCROOT=${srv}/docroot" "${steps}" || fail "DOCROOT の行を差し替えられません"
+	# 1 行ずつ貼るのと同じく、-e なしで実行する.
+	HOME="${srv}/home" "${TOOL_BASH}" "${steps}" >"${TEST_ROOT}/server-out.txt" 2>&1
+	assert_eq "2.1.0" "$(cat "${srv}/docroot/landing/VERSION")" "差し替え後の版"
+	assert_eq "<h1>lp 2.1.0</h1>" "$(cat "${srv}/docroot/landing/index.html")" "差し替え後の index.html"
+	assert_no_file "${srv}/docroot/landing/removed-later.txt"          # 上書き展開ではないので、旧版のファイルは残らない
+	assert_file "${srv}/home/releases/landing.bak-2.0.0/removed-later.txt"   # 旧版は docroot の外に退避されている
+	assert_file "${srv}/docroot/other/keep.txt"
+	assert_eq "landing other" "$(find "${srv}/docroot" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" "docroot の中(退避した旧版が URL で見えない)"
+	# 戻すとき.
+	rollback="$(extract_rollback)"
+	HOME="${srv}/home" DOCROOT="${srv}/docroot" "${TOOL_BASH}" -c "${rollback}" >/dev/null 2>&1
+	assert_eq "2.0.0" "$(cat "${srv}/docroot/landing/VERSION")" "戻した後の版"
+	assert_eq "2.1.0" "$(cat "${srv}/home/releases/landing.failed-2.1.0/VERSION")" "退避された失敗版"
+}
+
+test_dir_hint_php_fallback_line_works() {
+	need_real_wp || return 0
+	command -v php >/dev/null 2>&1 || { skip "php が無い"; return 0; }
+	php -r 'exit(class_exists("ZipArchive") ? 0 : 1);' || { skip "php に ZipArchive が無い"; return 0; }
+	mk_docroot h5
+	run_tool landing; assert_rc 0
+	local line work="${TEST_ROOT}/phpx"
+	line="$(printf '%s\n' "${OUT}" | grep '^php -r')"
+	[ -n "${line}" ] || { fail "php -r の行が表示されていません"; return 0; }
+	mkdir -p "${work}" && cp "${OUTD}/landing.2.0.0.zip" "${work}/" && cd "${work}" || return 1
+	"${TOOL_BASH}" -c "${line}" >/dev/null 2>&1
+	assert_file "${work}/landing.2.0.0/landing/VERSION"
+}
+
+test_dir_hint_omits_the_version_check_when_version_is_not_in_the_zip() {
+	need_real_wp || return 0
+	mk_docroot h6
+	run_tool lpx
+	assert_rc 0
+	assert_has "警告: Zip に lpx/VERSION が入っていないので"
+	assert_lacks "cat lpx.5.0.0/lpx/VERSION"
+}
+
+test_dry_run_prints_no_hint() {
+	need_real_wp || return 0
+	mk_docroot h7
+	run_tool landing --dry-run
+	assert_rc 0
+	assert_lacks "アップロードの手順"
+}
+
+test_rebuild_hint_uses_the_tag_before_the_rebuilt_one() {
+	need_real_wp || return 0
+	mk_docroot h8
+	run_tool landing; assert_rc 0           # 2.0.0
+	release_lp 2.1.0
+	rm -f "${OUTD}/landing.2.1.0.zip"
+	run_tool landing --rebuild 2.1.0
+	assert_rc 0
+	assert_has "landing.bak-2.0.0"
+}
+
+tests_main "$@"

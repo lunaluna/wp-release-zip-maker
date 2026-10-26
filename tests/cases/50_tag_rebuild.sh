@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# 注釈付きタグと --rebuild のテスト(実物の `wp dist-archive` と zip・unzip が要る. 無ければ SKIP).
+# shellcheck disable=SC2329,SC2317  # test_ で始まる関数は、tests_main が名前で呼ぶ(shellcheck には呼び出しが見えない)
+# shellcheck source=../lib.sh
+source "$(dirname "$0")/../lib.sh"
+
+need_real_wp() {
+	if have_dist_archive; then
+		return 0
+	fi
+	skip "実物の wp dist-archive・zip・unzip が無い"
+	return 1
+}
+
+# タグのメッセージの中の、見出し($2)の値を出す(例: SHA-256). $1 = タグ名.
+tag_field() {
+	git tag -l --format='%(contents)' "$1" | sed -n "s/^$2: *//p" | head -n 1
+}
+
+# --- 通常実行のタグ --------------------------------------------------------------------------------
+
+test_build_creates_an_annotated_tag_with_the_record() {
+	need_real_wp || return 0
+	mk_docroot t1
+	run_tool my-plugin
+	assert_rc 0
+	local tag="my-plugin/1.2.3" z="${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "tag" "$(git cat-file -t "${tag}")" "タグの種類(tag = 注釈付き)"
+	assert_eq "$(git rev-parse HEAD)" "$(git rev-parse "${tag}^{commit}")" "タグが指すコミット"
+	assert_eq "my-plugin 1.2.3" "$(git tag -l --format='%(contents:subject)' "${tag}")" "タグのメッセージの 1 行目"
+	assert_eq "my-plugin.1.2.3.zip" "$(tag_field "${tag}" "Zip")" "記録された Zip の名前"
+	assert_eq "$(sha256_file "${z}")" "$(tag_field "${tag}" "SHA-256")" "記録された Zip の SHA-256"
+	printf '%s' "$(tag_field "${tag}" "Content-SHA-256")" | grep -qE '^[0-9a-f]{64}$' || fail "Content-SHA-256 が 64 桁の 16 進数ではありません"
+	printf '%s' "$(tag_field "${tag}" "Built-with")" | grep -q '^wp-release-zip-maker ' || fail "Built-with がありません"
+	assert_has "を打ちました(注釈付き"
+	assert_has "push はしていません"
+}
+
+test_each_target_gets_its_own_tag() {
+	need_real_wp || return 0
+	mk_docroot t2
+	run_tool my-plugin; assert_rc 0
+	run_tool my-theme; assert_rc 0
+	assert_eq "my-plugin/1.2.3 my-theme/0.1.0" "$(git tag | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" "打たれたタグ"
+}
+
+test_tag_format_is_applied() {
+	need_real_wp || return 0
+	mk_docroot t3
+	set_config "tag_format = {slug}@{version}
+output = ${OUTD}
+plugin ${P}"
+	run_tool my-plugin
+	assert_rc 0
+	assert_eq "my-plugin@1.2.3" "$(git tag)" "打たれたタグ"
+}
+
+test_single_target_tag_is_a_bare_version() {
+	need_real_wp || return 0
+	mk_single t4
+	run_tool solo-plugin
+	assert_rc 0
+	assert_eq "0.5.0" "$(git tag)" "打たれたタグ(v を付けない素の版番号)"
+}
+
+test_missing_committer_stops_before_the_zip() {
+	need_real_wp || return 0
+	mk_docroot t5
+	run_tool_env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.useConfigOnly GIT_CONFIG_VALUE_0=true -- my-plugin
+	assert_rc 1
+	assert_has "コミッターの名前・メールが決まっていません"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "打たれたタグ"
+}
+
+test_tag_failure_removes_the_zip() {
+	need_real_wp || return 0
+	mk_docroot t6
+	# タグの署名を求め、壊れた gpg を指して、タグの作成だけを失敗させる.
+	run_tool_env GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=tag.gpgSign GIT_CONFIG_VALUE_0=true GIT_CONFIG_KEY_1=gpg.program "GIT_CONFIG_VALUE_1=$(command -v false)" -- my-plugin
+	assert_rc 1
+	assert_has "を打てませんでした(Zip は消しました)"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "" "$(git tag)" "打たれたタグ"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残された一時ディレクトリの数"
+}
+
+# --- --rebuild -----------------------------------------------------------------------------------
+
+test_rebuild_reproduces_the_content_without_a_new_tag() {
+	need_real_wp || return 0
+	mk_docroot r1
+	run_tool my-plugin; assert_rc 0
+	local before_tag names_before
+	before_tag="$(git rev-parse my-plugin/1.2.3)"
+	names_before="$(zip_names "${OUTD}/my-plugin.1.2.3.zip" | LC_ALL=C sort)"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	run_tool my-plugin --rebuild
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と一致しました"
+	assert_eq "${names_before}" "$(zip_names "${OUTD}/my-plugin.1.2.3.zip" | LC_ALL=C sort)" "作り直した Zip のファイル一覧"
+	assert_eq "${before_tag}" "$(git rev-parse my-plugin/1.2.3)" "タグ(変わらない)"
+	assert_eq "1" "$(git tag | wc -l | tr -d ' ')" "タグの数"
+}
+
+test_rebuild_never_overwrites_an_existing_zip() {
+	need_real_wp || return 0
+	mk_docroot r2
+	run_tool my-plugin; assert_rc 0
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "このツールは上書きしません"
+}
+
+test_rebuild_builds_from_the_tag_not_the_worktree() {
+	need_real_wp || return 0
+	mk_docroot r3
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	echo "changed" >> "${P}/my main.php"   # 作業ツリーが汚れている(コミットしていない)
+	echo "ignored" > "${P}/local.txt"
+	run_tool my-plugin --rebuild
+	assert_rc 0
+	zip_cat "${OUTD}/my-plugin.1.2.3.zip" "my-plugin/my main.php" | grep -q changed && fail "作業ツリーの未コミットの変更が Zip に入っています"
+	if zip_has "${OUTD}/my-plugin.1.2.3.zip" "my-plugin/local.txt"; then fail "無視されたファイルが Zip に入っています"; fi
+}
+
+test_rebuild_an_older_version_after_the_version_moved_on() {
+	need_real_wp || return 0
+	mk_docroot r4
+	run_tool my-plugin; assert_rc 0
+	bump_plugin 1.3.0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	LABEL="版を省く(HEAD は 1.3.0 でタグなし)"; run_tool my-plugin --rebuild; assert_rc 1; assert_has "タグ my-plugin/1.3.0 がありません"
+	LABEL="--rebuild 1.2.3"; run_tool my-plugin --rebuild 1.2.3; assert_rc 0
+	zip_cat "${OUTD}/my-plugin.1.2.3.zip" "my-plugin/my main.php" | grep -q "Version: 1.2.3" || fail "作り直した Zip が 1.2.3 の内容ではありません"
+	assert_has "内容の指紋が、タグの記録と一致しました"
+}
+
+test_rebuild_reports_a_fingerprint_mismatch() {
+	need_real_wp || return 0
+	mk_docroot r5
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	# 内容の指紋だけが違うタグに付け替える.
+	printf 'my-plugin 1.2.3\n\nZip: my-plugin.1.2.3.zip\nSHA-256: %064d\nContent-SHA-256: %064d\nBuilt-with: x\n' 0 1 |
+		git tag -f -a -F - my-plugin/1.2.3 HEAD >/dev/null
+	run_tool my-plugin --rebuild
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と違います"
+	assert_has "$(printf '%064d' 1)"
+}
+
+test_rebuild_without_a_recorded_fingerprint() {
+	need_real_wp || return 0
+	mk_docroot r6
+	git tag my-plugin/1.2.3   # 軽量タグ(このツールで打ったものではない)
+	run_tool my-plugin --rebuild
+	assert_rc 0
+	assert_has "内容の指紋(Content-SHA-256)の記録がありません"
+}
+
+test_rebuild_in_a_subdirectory_layout() {
+	need_real_wp || return 0
+	mk_docroot r7 app/public
+	run_tool my-theme; assert_rc 0
+	rm -f "${OUTD}/my-theme.0.1.0.zip"
+	run_tool my-theme --rebuild
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と一致しました"
+}
+
+test_rebuild_with_dot_path() {
+	need_real_wp || return 0
+	mk_single r8
+	run_tool solo-plugin; assert_rc 0
+	rm -f "${OUTD}/solo-plugin.0.5.0.zip"
+	LABEL="Git のルート"; run_tool solo-plugin --rebuild; assert_rc 0; assert_has "内容の指紋が、タグの記録と一致しました"
+	mk_single r8b sub/dir
+	run_tool solo-plugin; assert_rc 0
+	rm -f "${OUTD}/solo-plugin.0.5.0.zip"
+	LABEL="サブディレクトリ"; run_tool solo-plugin --rebuild; assert_rc 0; assert_has "内容の指紋が、タグの記録と一致しました"
+}
+
+tests_main "$@"
