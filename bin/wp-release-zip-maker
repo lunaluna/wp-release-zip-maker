@@ -930,6 +930,38 @@ print_zip_summary() {
 
 # --- タグ ---------------------------------------------------------------------------------------
 
+# タグのメッセージの、見出し($2)の行の残り全部(空白は前後を取る)を標準出力へ出す. 無ければ何も出さない. $1 = タグ名.
+# tag_recorded_field は 16 進数だけを読む(ハッシュ用)ので、版のような文字列にはこちらを使う.
+tag_recorded_text() {
+	git -C "${GIT_TOP}" tag -l --format='%(contents)' "$1" | sed -n "s/^$2:[[:space:]]*\\(.*[^[:space:]]\\)[[:space:]]*\$/\\1/p" | head -n 1
+}
+
+# --- Zip を作った道具の版 ----------------------------------------------------------------------
+#
+# タグに記録して、--rebuild で内容が違ったときに、道具の版が変わったのかをたどれるようにする.
+# 調べられなければ 'unknown'(記録のために Zip の作成を止めはしない). どれも標準出力へ版だけを出す.
+# 取り方は、この Mac での実測による(2026-10-26): wp --version = 'WP-CLI 2.12.0'・
+#   wp package list --fields=name,version --format=csv の行 = 'wp-cli/dist-archive-command,v3.1.0'・zip -v の 2 行目 = 'This is Zip 3.0 (...)'.
+# Composer の Deprecated 警告(Mac の PHP 8.4 + WP-CLI 2.12.0)は、取り除く. stdin を閉じるのは、万一待たれても止まらないようにするため.
+
+wp_cli_version() {
+	local v
+	v="$("${WP_BIN}" --version 2>/dev/null </dev/null | grep -v -i 'deprecated' | sed -n 's/^WP-CLI[[:space:]]*//p' | head -n 1 | tr -d '\r')"
+	printf '%s' "${v:-unknown}"
+}
+
+dist_archive_version() {
+	local v
+	v="$("${WP_BIN}" package list --fields=name,version --format=csv 2>/dev/null </dev/null | sed -n 's#^wp-cli/dist-archive-command,v\{0,1\}##p' | head -n 1 | tr -d '\r')"
+	printf '%s' "${v:-unknown}"
+}
+
+zip_version() {
+	local v
+	v="$(zip -v 2>&1 </dev/null | sed -n 's/^This is Zip \([^ ]*\).*$/\1/p' | head -n 1)"
+	printf '%s' "${v:-unknown}"
+}
+
 # コミッターの名前・メールが決まっているか(注釈付きタグを打つのに要る). 決まっていなければ止める.
 # `git var GIT_COMMITTER_IDENT` は、名前やメールを自動で決められないときに失敗する.
 check_git_identity() {
@@ -941,7 +973,7 @@ check_git_identity() {
 
 # 注釈付きタグを打つ. 打てなければ非 0 を返す(Zip の後始末は呼び出し側).
 #   $1 = タグ名 / $2 = コミット / $3 = スラッグ / $4 = 版 / $5 = Zip のパス
-# メッセージ: 1 行目 = '<スラッグ> <版>'. 本文 = Zip の名前・SHA-256・内容の指紋・ツールの版.
+# メッセージ: 1 行目 = '<スラッグ> <版>'. 本文 = Zip の名前・SHA-256・内容の指紋・ツールの版・Zip を作った道具(WP-CLI・dist-archive・zip)の版.
 #   SHA-256         = 配布した Zip そのもの(バイト列)の SHA-256. 手元の Zip が配布したものと同じかを確かめるための記録.
 #   Content-SHA-256 = Zip の内容の指紋(zip_content_digest). --rebuild が、作り直した Zip の内容と比べる.
 #                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. unzip が無ければこの行は書かない.
@@ -952,6 +984,9 @@ create_tag() {
 		printf '%s %s\n\nZip: %s\nSHA-256: %s\n' "${slug}" "${ver}" "$(basename "${zip_file}")" "$(sha256_of "${zip_file}")"
 		[ -z "${content}" ] || printf 'Content-SHA-256: %s\n' "${content}"
 		printf 'Built-with: %s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
+		printf 'WP-CLI: %s\n' "$(wp_cli_version)"
+		printf 'dist-archive: %s\n' "$(dist_archive_version)"
+		printf 'zip: %s\n' "$(zip_version)"
 	} | git -C "${GIT_TOP}" tag -a -F - "${tag}" "${commit}"
 }
 
@@ -1181,6 +1216,34 @@ cmd_build() {
 	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 }
 
+# 内容が違ったとき、Zip を作った道具の版を「タグの記録 → 今回」で並べて表示する(違うものに印を付ける).
+# 記録の無い欄(旧タグ)は「(記録なし)」とし、違いの印は付けない. 記録があるものがすべて同じなら、そう伝える.
+#   $1 = タグ名
+print_tool_version_comparison() {
+	local tag="$1" key label rec now diff=0 unrecorded=0 mark
+	printf '  使った道具の版(タグの記録 → 今回):\n'
+	for key in wp_cli dist_archive zip; do
+		case "${key}" in
+			wp_cli) label="WP-CLI"; now="$(wp_cli_version)" ;;
+			dist_archive) label="dist-archive"; now="$(dist_archive_version)" ;;
+			zip) label="zip"; now="$(zip_version)" ;;
+		esac
+		rec="$(tag_recorded_text "${tag}" "${label}")"
+		mark=""
+		if [ -z "${rec}" ]; then
+			rec="(記録なし)"
+			unrecorded=1
+		elif [ "${rec}" != "${now}" ]; then
+			mark="  ← 違います"
+			diff=1
+		fi
+		printf '    %-13s %s → %s%s\n' "${label}:" "${rec}" "${now}" "${mark}"
+	done
+	if [ "${diff}" -eq 0 ] && [ "${unrecorded}" -eq 0 ]; then
+		printf '  道具の版はすべて同じです(違いの原因は、版以外にあります. たとえば、タグの後に変わった環境や、zip の動作の差です).\n'
+	fi
+}
+
 # --rebuild で作り直した Zip を、タグに記録された値と比べて表示する. 内容の指紋が記録と違えば、止める(終了コード 1・Zip は消す).
 # 比べるのは「内容の指紋」. Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため)ので、
 # 一致しなくてよい. 配布済みの Zip と同じか確かめたいときは、その Zip の SHA-256 を、タグに記録された SHA-256 と比べる.
@@ -1203,6 +1266,7 @@ check_rebuild_digest() {
 		mismatch=1
 		printf '  内容の指紋が、タグの記録と違います.\n    タグの記録: %s\n    今回:       %s\n' "${recorded}" "${now}"
 		printf '  .distignore・zip・wp dist-archive の版や、タグの後の環境の違いで、入るファイルが変わった可能性があります. 中身(上の内訳)を確かめてください.\n'
+		print_tool_version_comparison "${tag}"
 	fi
 	# 配布した Zip の現物との照合用に、タグに記録された SHA-256 を添える(記録がなければ何も言わない).
 	recorded="$(tag_recorded_field "${tag}" "SHA-256")"

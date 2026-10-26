@@ -224,7 +224,7 @@ test_rebuild_stops_when_the_builder_produces_different_content() {
 	local real fake
 	real="$(command -v wp)"
 	# mktemp は使わない(出力先の Zip と同じディレクトリの下に、作業用のディレクトリを作る).
-	fake="$(make_fake_wp differ "'${real}' \"\$@\" || exit \$?; d=\"\$(dirname \"\$3\")/work\$\$\" && mkdir -p \"\$d/my-plugin\" && echo extra > \"\$d/my-plugin/extra.txt\" && (cd \"\$d\" && zip -q \"\$3\" my-plugin/extra.txt); rm -rf \"\$d\"")"
+	fake="$(make_fake_wp differ "[ \"\$1\" = dist-archive ] || exec '${real}' \"\$@\"; '${real}' \"\$@\" || exit \$?; d=\"\$(dirname \"\$3\")/work\$\$\" && mkdir -p \"\$d/my-plugin\" && echo extra > \"\$d/my-plugin/extra.txt\" && (cd \"\$d\" && zip -q \"\$3\" my-plugin/extra.txt); rm -rf \"\$d\"")"
 	LABEL="止める"; run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin --rebuild
 	assert_rc 1
 	assert_has "内容の指紋が、タグの記録と違います"
@@ -233,6 +233,83 @@ test_rebuild_stops_when_the_builder_produces_different_content() {
 	LABEL="許可する"; run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin --rebuild --allow-content-change
 	assert_rc 0
 	zip_has "${OUTD}/my-plugin.1.2.3.zip" "my-plugin/extra.txt" || fail "足したファイルが入っていません(テストの前提)"
+}
+
+# 今のタグのメッセージの、内容の指紋($1)だけを差し替えたタグに付け替える(道具の版の欄はそのまま). Zip は消す.
+retag_with_digest() {
+	local msg
+	msg="$(git tag -l --format='%(contents)' my-plugin/1.2.3 | sed "s/^Content-SHA-256: .*/Content-SHA-256: $1/")"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	printf '%s\n' "${msg}" | git tag -f -a -F - my-plugin/1.2.3 HEAD >/dev/null
+}
+
+# タグに、Zip を作ったときの WP-CLI・dist-archive・zip の版が記録されること(作り直しで内容が違ったときの手がかり).
+test_tag_records_the_tool_versions() {
+	need_real_wp || return 0
+	mk_docroot b1
+	run_tool my-plugin; assert_rc 0
+	local tag="my-plugin/1.2.3" wp_v zip_v
+	wp_v="$(wp --version 2>/dev/null | grep -v -i deprecated | sed -n 's/^WP-CLI *//p' | head -n 1)"
+	zip_v="$(zip -v 2>&1 | sed -n 's/^This is Zip \([^ ]*\).*$/\1/p' | head -n 1)"
+	[ -n "${wp_v}" ] && [ -n "${zip_v}" ] || { fail "テストの前提: wp・zip の版を読めません"; return 0; }
+	assert_eq "${wp_v}" "$(tag_field "${tag}" "WP-CLI")" "記録された WP-CLI の版"
+	assert_eq "${zip_v}" "$(tag_field "${tag}" "zip")" "記録された zip の版"
+	printf '%s' "$(tag_field "${tag}" "dist-archive")" | grep -qE '^[0-9]+\.[0-9]+' || fail "dist-archive の版が記録されていません: $(tag_field "${tag}" "dist-archive")"
+}
+
+# 版を調べられないときは、unknown と記録して、Zip の作成は続ける(版の記録のために止めない).
+test_tag_records_unknown_when_a_version_cannot_be_read() {
+	need_real_wp || return 0
+	mk_docroot b2
+	local real fake
+	real="$(command -v wp)"
+	# dist-archive の呼び出しだけ本物に渡し、--version・package list は失敗させる.
+	fake="$(make_fake_wp noversion "[ \"\$1\" = dist-archive ] && exec '${real}' \"\$@\"; exit 1")"
+	run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin
+	assert_rc 0
+	assert_eq "unknown" "$(tag_field my-plugin/1.2.3 "WP-CLI")" "WP-CLI の版"
+	assert_eq "unknown" "$(tag_field my-plugin/1.2.3 "dist-archive")" "dist-archive の版"
+}
+
+# 内容が違って止めるとき、道具の版を「タグの記録 → 今回」で並べ、違うものに印を付けること.
+test_rebuild_mismatch_compares_the_tool_versions() {
+	need_real_wp || return 0
+	mk_docroot b3
+	run_tool my-plugin; assert_rc 0
+	# 記録の WP-CLI と dist-archive の版を、今と違う値にして、指紋も違う値にする.
+	local msg
+	msg="$(git tag -l --format='%(contents)' my-plugin/1.2.3 | sed -e "s/^Content-SHA-256: .*/Content-SHA-256: $(printf '%064d' 1)/" -e 's/^WP-CLI: .*/WP-CLI: 1.0.0/' -e 's/^dist-archive: .*/dist-archive: 0.0.1/')"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	printf '%s\n' "${msg}" | git tag -f -a -F - my-plugin/1.2.3 HEAD >/dev/null
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "使った道具の版(タグの記録 → 今回)"
+	printf '%s\n' "${OUT}" | grep -aE 'WP-CLI: +1\.0\.0 →' | grep -aq '違います' || fail "WP-CLI の違いに印が付いていません"
+	printf '%s\n' "${OUT}" | grep -aE 'dist-archive: +0\.0\.1 →' | grep -aq '違います' || fail "dist-archive の違いに印が付いていません"
+	printf '%s\n' "${OUT}" | grep -aE '^ +zip: ' | grep -aq '違います' && fail "同じ zip の版に、違うという印が付いています"
+}
+
+# 道具の版がすべて同じなのに内容が違うときは、そう伝える(原因は版以外にある).
+test_rebuild_mismatch_says_when_the_tool_versions_are_the_same() {
+	need_real_wp || return 0
+	mk_docroot b4
+	run_tool my-plugin; assert_rc 0
+	retag_with_digest "$(printf '%064d' 1)"
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "道具の版はすべて同じです"
+	assert_lacks "違います)"
+}
+
+# 旧タグ(道具の版の記録がない)では、記録なしと表示する.
+test_rebuild_mismatch_with_no_recorded_tool_versions() {
+	need_real_wp || return 0
+	mk_docroot b5
+	run_tool my-plugin; assert_rc 0
+	retag_with_fingerprint "$(printf '%064d' 1)"   # 道具の版の欄が無いタグ
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "(記録なし)"
 }
 
 test_rebuild_without_a_recorded_fingerprint() {

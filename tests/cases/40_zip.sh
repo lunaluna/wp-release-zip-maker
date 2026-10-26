@@ -290,7 +290,7 @@ test_a_file_created_during_the_build_is_not_overwritten() {
 	mk_docroot e2
 	local final="${OUTD}/my-plugin.1.2.3.zip" real fake
 	real="$(command -v wp)"
-	fake="$(make_fake_wp race "'${real}' \"\$@\"; rc=\$?; mkdir -p '${OUTD}'; echo competitor > '${final}'; exit \$rc")"
+	fake="$(make_fake_wp race "[ \"\$1\" = dist-archive ] || exec '${real}' \"\$@\"; '${real}' \"\$@\"; rc=\$?; mkdir -p '${OUTD}'; echo competitor > '${final}'; exit \$rc")"
 	run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin
 	assert_rc 1
 	assert_has "すでにあります"
