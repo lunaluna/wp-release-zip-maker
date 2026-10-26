@@ -137,18 +137,88 @@ test_rebuild_an_older_version_after_the_version_moved_on() {
 	assert_has "内容の指紋が、タグの記録と一致しました"
 }
 
-test_rebuild_reports_a_fingerprint_mismatch() {
+# 内容の指紋だけが違うタグに付け替える(Zip は消す). 引数 = 付け替える指紋の値(64 桁).
+retag_with_fingerprint() {
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	printf 'my-plugin 1.2.3\n\nZip: my-plugin.1.2.3.zip\nSHA-256: %064d\nContent-SHA-256: %s\nBuilt-with: x\n' 0 "$1" |
+		git tag -f -a -F - my-plugin/1.2.3 HEAD >/dev/null
+}
+
+test_rebuild_stops_on_a_fingerprint_mismatch() {
 	need_real_wp || return 0
 	mk_docroot r5
 	run_tool my-plugin; assert_rc 0
-	rm -f "${OUTD}/my-plugin.1.2.3.zip"
-	# 内容の指紋だけが違うタグに付け替える.
-	printf 'my-plugin 1.2.3\n\nZip: my-plugin.1.2.3.zip\nSHA-256: %064d\nContent-SHA-256: %064d\nBuilt-with: x\n' 0 1 |
-		git tag -f -a -F - my-plugin/1.2.3 HEAD >/dev/null
+	retag_with_fingerprint "$(printf '%064d' 1)"
 	run_tool my-plugin --rebuild
-	assert_rc 0
+	assert_rc 1
 	assert_has "内容の指紋が、タグの記録と違います"
 	assert_has "$(printf '%064d' 1)"
+	assert_has "--allow-content-change"
+	assert_lacks "アップロードの手順"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"   # 違う内容の Zip を、配布できる名前で残さない
+}
+
+test_rebuild_allows_a_fingerprint_mismatch_when_told_to() {
+	need_real_wp || return 0
+	mk_docroot r5b
+	run_tool my-plugin; assert_rc 0
+	retag_with_fingerprint "$(printf '%064d' 1)"
+	run_tool my-plugin --rebuild --allow-content-change
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と違います"
+	assert_has "--allow-content-change が指定されているので続行します"
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+}
+
+test_allow_content_change_needs_rebuild() {
+	need_real_wp || return 0
+	mk_docroot r5c
+	run_tool my-plugin --allow-content-change
+	assert_rc 2
+	assert_has "--allow-content-change は --rebuild のときだけ"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+}
+
+# CRC-32 が同じ別の内容でも、指紋が変わること(CRC-32 は、同じ値になる別の内容を意図的に作れるため).
+# "plumless" と "buckeroo" は、どちらも CRC-32 = 4ddb0c25.
+test_fingerprint_tells_apart_files_with_the_same_crc32() {
+	need_real_wp || return 0
+	mk_docroot f1
+	printf 'plumless' > "${P}/payload.txt"; gcommit "payload a"
+	run_tool my-plugin; assert_rc 0
+	local fp_a crc_a
+	fp_a="$(tag_field my-plugin/1.2.3 Content-SHA-256)"
+	crc_a="$(unzip -v "${OUTD}/my-plugin.1.2.3.zip" | awk '/payload.txt$/ {print $7}')"
+	mk_docroot f2
+	printf 'buckeroo' > "${P}/payload.txt"; gcommit "payload b"
+	run_tool my-plugin; assert_rc 0
+	local fp_b crc_b
+	fp_b="$(tag_field my-plugin/1.2.3 Content-SHA-256)"
+	crc_b="$(unzip -v "${OUTD}/my-plugin.1.2.3.zip" | awk '/payload.txt$/ {print $7}')"
+	assert_eq "4ddb0c25" "${crc_a}" "a の CRC-32(テストの前提)"
+	assert_eq "${crc_a}" "${crc_b}" "b の CRC-32(テストの前提: a と同じ)"
+	[ "${fp_a}" != "${fp_b}" ] || fail "CRC-32 が同じ別の内容で、指紋が同じになりました(${fp_a})"
+}
+
+# ファイルの内容・名前・実行権限のどれが違っても、指紋が変わること.
+test_fingerprint_changes_with_content_name_and_mode() {
+	need_real_wp || return 0
+	local base v
+	mk_docroot f3
+	run_tool my-plugin; assert_rc 0
+	base="$(tag_field my-plugin/1.2.3 Content-SHA-256)"
+	mk_docroot f4; echo 2 > "${P}/assets/app.js"; gcommit "content"
+	run_tool my-plugin; assert_rc 0
+	v="$(tag_field my-plugin/1.2.3 Content-SHA-256)"
+	[ "${base}" != "${v}" ] || fail "ファイルの内容が違うのに、指紋が同じです"
+	mk_docroot f5; git mv "${P}/assets/app.js" "${P}/assets/app2.js"; gcommit "name"
+	run_tool my-plugin; assert_rc 0
+	v="$(tag_field my-plugin/1.2.3 Content-SHA-256)"
+	[ "${base}" != "${v}" ] || fail "ファイル名が違うのに、指紋が同じです"
+	mk_docroot f6; chmod +x "${P}/assets/app.js"; gcommit "mode"
+	run_tool my-plugin; assert_rc 0
+	v="$(tag_field my-plugin/1.2.3 Content-SHA-256)"
+	[ "${base}" != "${v}" ] || fail "実行権限が違うのに、指紋が同じです"
 }
 
 test_rebuild_without_a_recorded_fingerprint() {
