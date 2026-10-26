@@ -255,6 +255,84 @@ test_htaccess_and_well_known_are_fine_in_a_dir() {
 	assert_has "landing/.gitkeep"
 }
 
+# --- 出力 Zip の排他(上書きしない) --------------------------------------------------------------
+
+# 出力先に、壊れたシンボリックリンク(行き先が無い)が同名であれば、その先へ書かず、すでにあるものとして止めること.
+test_dangling_symlink_at_the_output_path_is_not_followed() {
+	need_real_wp || return 0
+	mk_docroot e1
+	mkdir -p "${OUTD}" && ln -s "${TEST_ROOT}/victim.zip" "${OUTD}/my-plugin.1.2.3.zip"
+	run_tool my-plugin
+	assert_rc 1
+	assert_has "Zip がすでにあります"
+	assert_no_file "${TEST_ROOT}/victim.zip"                         # リンクの先に書いていない
+	[ -L "${OUTD}/my-plugin.1.2.3.zip" ] || fail "シンボリックリンクが消えました"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+	# --rebuild も同じ.
+	git tag my-plugin/1.2.3
+	LABEL="--rebuild"; run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "Zip がすでにあります"
+	assert_no_file "${TEST_ROOT}/victim.zip"
+}
+
+# 確認のあと、作っている間に別のプロセスが同じ名前のファイルを作っても、それを上書きしないこと(確認と作成が別の操作になる隙間).
+# 偽の wp が、本物の wp dist-archive を呼んだあとで、最終の Zip のパスに別のファイルを置く.
+test_a_file_created_during_the_build_is_not_overwritten() {
+	need_real_wp || return 0
+	mk_docroot e2
+	local final="${OUTD}/my-plugin.1.2.3.zip" real fake
+	real="$(command -v wp)"
+	fake="$(make_fake_wp race "'${real}' \"\$@\"; rc=\$?; mkdir -p '${OUTD}'; echo competitor > '${final}'; exit \$rc")"
+	run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin
+	assert_rc 1
+	assert_has "すでにあります"
+	assert_eq "competitor" "$(cat "${final}")" "別のプロセスが作ったファイル(上書きしない)"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+	assert_eq "1" "$(find "${OUTD}" -mindepth 1 | wc -l | tr -d ' ')" "出力先の中のファイル(一時ファイルを残さない)"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+}
+
+# 同じものを同時に 2 つ実行しても、Zip とタグが 1 つずつできて、片方は止まること.
+test_parallel_runs_make_exactly_one_zip_and_tag() {
+	need_real_wp || return 0
+	mk_docroot e3
+	("${TOOL_BASH}" "${TOOL}" my-plugin >"${TEST_ROOT}/par1.txt" 2>&1; echo $? > "${TEST_ROOT}/par1.rc") &
+	("${TOOL_BASH}" "${TOOL}" my-plugin >"${TEST_ROOT}/par2.txt" 2>&1; echo $? > "${TEST_ROOT}/par2.rc") &
+	wait
+	assert_eq "0 1" "$(cat "${TEST_ROOT}/par1.rc" "${TEST_ROOT}/par2.rc" | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//')" "終了コード(1 つが成功・1 つが停止)"
+	assert_eq "1" "$(find "${OUTD}" -mindepth 1 | wc -l | tr -d ' ')" "出力先の中のファイル"
+	assert_eq "my-plugin/1.2.3" "$(git tag)" "タグ"
+	unzip -tq "${OUTD}/my-plugin.1.2.3.zip" >/dev/null 2>&1 || fail "Zip が壊れています"
+}
+
+# 作った Zip の権限は、umask どおりになる(一時ファイルの 0600 のままにならない).
+test_the_zip_gets_the_umask_permissions() {
+	need_real_wp || return 0
+	mk_docroot e4
+	umask 022
+	run_tool my-plugin
+	assert_rc 0
+	# shellcheck disable=SC2012  # ファイル名は固定の ASCII. 権限の文字列(先頭の 10 文字)を読むのに ls -l が手軽
+	assert_eq "-rw-r--r--" "$(ls -l "${OUTD}/my-plugin.1.2.3.zip" | cut -c1-10)" "Zip の権限"
+}
+
+# 出力先に、シェルの特殊文字(; ' " $() バッククォート & ( ) * ? など)があっても、Zip を作れること.
+# 以前は wp dist-archive が、これらを含む出力先を扱えず失敗した(Zip を安全な一時パスで作って、最終のパスへ移すようにして解消).
+test_output_path_with_shell_metacharacters() {
+	need_real_wp || return 0
+	mk_docroot e5
+	local weird="${TEST_ROOT}/ou t';\$(touch ${TEST_ROOT}/pwned)\"\`x&(y)*?"
+	set_config "tag_format = {slug}/{version}
+output = ${weird}
+plugin ${P}"
+	run_tool my-plugin
+	assert_rc 0
+	assert_file "${weird}/my-plugin.1.2.3.zip"
+	assert_no_file "${TEST_ROOT}/pwned"
+	assert_eq "1" "$(find "${weird}" -mindepth 1 | wc -l | tr -d ' ')" "出力先の中のファイル(一時ファイルを残さない)"
+}
+
 test_second_run_stops_because_tag_and_zip_exist() {
 	need_real_wp || return 0
 	mk_docroot z9

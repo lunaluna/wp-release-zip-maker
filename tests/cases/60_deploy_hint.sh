@@ -139,6 +139,29 @@ dir lp landing"
 	assert_eq "${weird}/landing.2.0.0.zip" "$(cat "${TEST_ROOT}/scp-arg1" 2>/dev/null)" "scp に渡った Zip のパス"
 }
 
+# 出力先に ; ' " $() バッククォート & ( ) * ? があっても、表示した scp の行が 1 つの引数として渡り、コマンドが実行されないこと.
+# (R5 より前は、wp dist-archive がこれらの出力先で Zip を作れず、scp の行まで届かなかった.)
+test_scp_line_quotes_shell_metacharacters() {
+	need_real_wp || return 0
+	mk_docroot h13
+	# shellcheck disable=SC2016
+	local weird="${TEST_ROOT}/ou t';\$(touch ${TEST_ROOT}/pwned)\"\`x&(y)*?" fakebin="${TEST_ROOT}/fakebin2" line
+	set_config "tag_format = {slug}/{version}
+output = ${weird}
+dir lp landing"
+	run_tool landing
+	assert_rc 0
+	line="$(printf '%s\n' "${OUT}" | grep '^scp ')"
+	[ -n "${line}" ] || { fail "scp の行が表示されていません"; return 0; }
+	mkdir -p "${fakebin}"
+	# shellcheck disable=SC2016
+	printf '#!/bin/sh\nprintf "%%s" "$1" > "%s/scp-arg1b"\n' "${TEST_ROOT}" > "${fakebin}/scp"
+	chmod +x "${fakebin}/scp"
+	PATH="${fakebin}:${PATH}" "${TOOL_BASH}" -c "${line}" >/dev/null 2>&1
+	assert_eq "${weird}/landing.2.0.0.zip" "$(cat "${TEST_ROOT}/scp-arg1b" 2>/dev/null)" "scp に渡った Zip のパス"
+	assert_no_file "${TEST_ROOT}/pwned"
+}
+
 # 疑似サーバーを作る(旧版 2.0.0 が docroot にある). 引数 = 名前. 出力: サーバーのルート.
 mk_server() {
 	local srv="${TEST_ROOT}/server-$1"

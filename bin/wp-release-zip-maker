@@ -584,11 +584,17 @@ check_version_files() {
 
 # 一時ディレクトリ(make_zip が作る). 終了時に必ず消す.
 TMP_WORK=""
+# 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
+PART_FILE=""
 
 # 一時ディレクトリを消す(trap から呼ぶ). 作っていなければ何もしない.
 cleanup_tmp() {
 	if [ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ]; then
 		rm -rf -- "${TMP_WORK}"
+	fi
+	# 出力先に作りかけの一時ファイル(publish_zip が作る)があれば、それも消す.
+	if [ -n "${PART_FILE}" ]; then
+		rm -f -- "${PART_FILE}"
 	fi
 }
 
@@ -668,7 +674,7 @@ human_size() {
 # 一時ディレクトリの下をスラッグと同じ名前にするのは、Zip の一番上のフォルダー名をスラッグにするため.
 make_zip() {
 	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5"
-	local tree_path dest st wp_out wp_rc
+	local tree_path dest st wp_out wp_rc built
 
 	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う). PREFIX は cmd_build が埋める.
 	tree_path="$(tree_path_of "${path}")"
@@ -690,20 +696,56 @@ make_zip() {
 	[ "${st[1]}" -eq 0 ] || die "tar での展開に失敗しました."
 	[ -n "$(ls -A "${dest}")" ] || die "${ref} の '${path}' にファイルがありません."
 
+	# Zip は、まず一時ディレクトリの中に作り、確認してから最終のパス(zip_file)へ移す(publish_zip).
+	# 理由: ①確認と作成の間に、別のプロセスが同じ名前のファイルを作っても、それを上書きしない. 壊れたシンボリックリンクの先へも書かない.
+	#       ②wp dist-archive は、出力先のパスに ; ' " $ ( ) ` & * ? などがあると Zip を作れない(2026-10-26 に確認).
+	#         安全なパスに作れば、出力先の名前の制約が無くなる. 検査に落ちた Zip も、最終のパスに現れない.
+	built="${TMP_WORK}/zip/$(basename "${zip_file}")"
+
 	# stdin を閉じるのは、万一 dist-archive が確認を求めても、待たずに落ちるようにするため.
 	# 出力は、Mac の PHP 8.4 + WP-CLI 2.12.0 が出す Composer の Deprecated 警告を除いて表示する.
-	wp_out="$("${WP_BIN}" dist-archive "${dest}" "${zip_file}" --plugin-dirname="${slug}" --create-target-dir 2>&1 </dev/null)"
+	wp_out="$("${WP_BIN}" dist-archive "${dest}" "${built}" --plugin-dirname="${slug}" --create-target-dir 2>&1 </dev/null)"
 	wp_rc=$?
 	wp_out="$(printf '%s\n' "${wp_out}" | grep -v -i '^\(PHP \)\{0,1\}Deprecated:' | grep -v '^$')"
-	if [ "${wp_rc}" -ne 0 ] || [ ! -f "${zip_file}" ]; then
-		# 作りかけの Zip を残さない(残ると、次回「タグの無い Zip」として止まる).
-		[ -f "${zip_file}" ] && rm -f -- "${zip_file}"
+	if [ "${wp_rc}" -ne 0 ] || [ ! -f "${built}" ]; then
 		die "wp dist-archive に失敗しました(終了コード ${wp_rc}):
 ${wp_out}"
 	fi
 
-	verify_zip "${slug}" "${zip_file}" "${kind}"
+	verify_zip "${slug}" "${built}" "${kind}"
 	warn_non_ascii_names "${dest}"
+	publish_zip "${built}" "${zip_file}"
+}
+
+# 作った Zip($1)を、最終のパス($2)へ、上書きせずに置く. すでに何かあれば(壊れたシンボリックリンクも)、置かずに止める.
+# 手順: 出力先と同じディスク上の一時ファイルへコピー → ln(ハードリンク)で最終のパスの名前を作る → 一時ファイルを消す.
+#   ln は、行き先がすでにあれば必ず失敗する(確認と作成が 1 つの操作になる). 一時ファイルは出力先と同じディスクに作るので、ln が使える.
+#   ハードリンクを作れないファイルシステムでは、mv -n で置く(あとで一時ファイルが残っていれば、すでにあったと判断する).
+# 一時ファイルは mktemp の 0600 のままにせず、umask どおりの権限にする(以前の dist-archive の出力と同じ).
+publish_zip() {
+	local src="$1" dest="$2" dir mode
+	dir="$(dirname "${dest}")"
+	mkdir -p -- "${dir}" || die "出力先 ${dir} を作れません."
+	PART_FILE="$(mktemp "${dir}/.$(basename "${dest}").XXXXXX")" || die "出力先 ${dir} に一時ファイルを作れません(書き込めますか?)."
+	mode="$(printf '%o' $((0666 & ~$(umask))))"
+	if ! { cp -- "${src}" "${PART_FILE}" && chmod "${mode}" "${PART_FILE}"; }; then
+		die "Zip を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)."
+	fi
+	if [ -e "${dest}" ] || [ -L "${dest}" ]; then
+		die "Zip がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+	fi
+	if ! ln -- "${PART_FILE}" "${dest}" 2>/dev/null; then
+		if [ -e "${dest}" ] || [ -L "${dest}" ]; then
+			die "Zip がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+		fi
+		# ハードリンクを作れない(ln が使えないファイルシステム). mv -n は、行き先があれば動かない.
+		mv -n -- "${PART_FILE}" "${dest}" 2>/dev/null
+		if [ -e "${PART_FILE}" ]; then
+			die "Zip を ${dest} へ置けませんでした(すでにあるか、書き込めません)."
+		fi
+	fi
+	rm -f -- "${PART_FILE}"
+	PART_FILE=""
 }
 
 # Zip に入るファイル名に ASCII 以外(日本語など)があれば警告する(止めはしない).
@@ -1034,19 +1076,19 @@ cmd_build() {
 	out="$(output_dir)"
 	zip_file="${out}/${slug}.${ver}.zip"
 	if [ "${rebuild}" -eq 1 ]; then
-		[ ! -e "${zip_file}" ] ||
+		{ [ ! -e "${zip_file}" ] && [ ! -L "${zip_file}" ]; } ||
 			die "Zip がすでにあります(${zip_file}). このツールは上書きしません. 作り直すなら、確かめて消してから実行してください."
 	else
 		tag="$(make_tag "${slug}" "${ver}")"
 		git check-ref-format "refs/tags/${tag}" ||
 			die "タグ名 '${tag}' は Git のタグ名として使えません(tag_format を見直してください)."
 		if tag_exists "${tag}"; then
-			if [ -e "${zip_file}" ]; then
+			if [ -e "${zip_file}" ] || [ -L "${zip_file}" ]; then
 				die "タグ ${tag} も Zip もすでにあります(${zip_file}). 新しい版を作るなら版を上げてください. 同じ版を作り直すなら、Zip を消してから --rebuild を使ってください."
 			fi
 			die "タグ ${tag} はすでにあります. 新しい版を作るなら版を上げてください. 同じ版の Zip を作り直すなら --rebuild を使ってください."
 		fi
-		if [ -e "${zip_file}" ]; then
+		if [ -e "${zip_file}" ] || [ -L "${zip_file}" ]; then
 			die "タグ ${tag} は無いのに、Zip がすでにあります(${zip_file}). 前回の作りかけか、別の作業の Zip です. 確かめて消してから実行してください."
 		fi
 	fi
