@@ -104,14 +104,155 @@ test_non_ascii_file_names_warn_but_do_not_break_the_summary() {
 	assert_has "my-theme/ の直下(ファイル数 名前):"
 }
 
-test_config_file_inside_the_zip_warns() {
+test_config_file_inside_the_zip_stops() {
 	need_real_wp || return 0
 	mk_single z8
 	printf '.distignore\n' > .distignore   # .wp-release を書き忘れた状態
 	gcommit "forgot .wp-release"
 	run_tool solo-plugin
+	assert_rc 1
+	assert_has "solo-plugin/.wp-release"
+	assert_has ".distignore に書いて"
+	assert_no_file "${OUTD}/solo-plugin.0.5.0.zip"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+}
+
+# --- 配布してはいけないファイル -----------------------------------------------------------------
+
+# 配布禁止の名前(止める). 例外はなく、外すには .distignore に書く. 形: プラグインの下のパス(1 行に 1 つ).
+FORBIDDEN_FILES='.env
+.env.local
+.env.example
+config/wp-config.php
+id_rsa
+id_ed25519
+keys/server.pem
+keys/a.key
+keys/a.p12
+keys/a.pfx
+.htpasswd
+.npmrc
+.netrc
+.git-credentials
+dump.sql
+dump.sql.gz
+db/x.dump
+a.bak
+a.orig
+a~
+a.swp
+.DS_Store
+.svn/entries'
+
+# プラグインの下に、配布禁止のファイルを作ってコミットする. 引数 = ファイルの一覧(1 行に 1 つ).
+commit_forbidden_files() {
+	local f
+	while IFS= read -r f; do
+		mkdir -p "${P}/$(dirname "${f}")" && echo secret > "${P}/${f}"
+	done <<LIST
+$1
+LIST
+	gcommit "forbidden files"
+}
+
+test_forbidden_files_stop_the_build() {
+	need_real_wp || return 0
+	mk_docroot z11
+	commit_forbidden_files "${FORBIDDEN_FILES}"
+	run_tool my-plugin
+	assert_rc 1
+	local f
+	# 止めるときは、見つけたものをすべて表示する(先頭の数行だけを見る show_out ではなく、OUT 全体を調べる).
+	while IFS= read -r f; do
+		assert_has "my-plugin/${f}"
+	done <<LIST
+${FORBIDDEN_FILES}
+LIST
+	assert_has "配布してはいけないファイル"
+	assert_has ".distignore に書いて"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "0" "$(git tag | wc -l | tr -d ' ')" "タグの数(何も作らない)"
+}
+
+test_forbidden_names_are_matched_case_insensitively() {
+	need_real_wp || return 0
+	mk_docroot z12
+	commit_forbidden_files 'WP-CONFIG.PHP
+Dump.SQL
+.ENV'
+	run_tool my-plugin
+	assert_rc 1
+	assert_has "my-plugin/WP-CONFIG.PHP"
+	assert_has "my-plugin/Dump.SQL"
+	assert_has "my-plugin/.ENV"
+}
+
+test_forbidden_files_pass_when_listed_in_distignore() {
+	need_real_wp || return 0
+	mk_docroot z13
+	commit_forbidden_files "${FORBIDDEN_FILES}"
+	# 禁止の名前を、すべて .distignore で外す(設定に許可リストは無い. 外す方法はこれだけ).
+	printf '/src\npackage.json\n.distignore\nnode_modules\n.env*\nwp-config.php\nid_rsa\nid_ed25519\n*.pem\n*.key\n*.p12\n*.pfx\n.htpasswd\n.npmrc\n.netrc\n.git-credentials\n*.sql\n*.sql.gz\n*.dump\n*.bak\n*.orig\n*~\n*.swp\n.DS_Store\n.svn\n' > "${P}/.distignore"
+	gcommit "distignore"
+	run_tool my-plugin
 	assert_rc 0
-	assert_has "solo-plugin/.wp-release(このツールの設定)が入っています"
+	assert_lacks "配布してはいけないファイル"
+	local f z="${OUTD}/my-plugin.1.2.3.zip"
+	while IFS= read -r f; do
+		if zip_has "${z}" "my-plugin/${f}"; then fail "除いたはずのファイルが入っています: ${f}"; fi
+	done <<LIST
+${FORBIDDEN_FILES}
+LIST
+}
+
+test_rebuild_checks_forbidden_files_in_the_tag() {
+	need_real_wp || return 0
+	mk_docroot z14
+	commit_forbidden_files '.env'
+	git tag my-plugin/1.2.3   # 禁止ファイルを含むコミットに、軽量タグを付ける
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "my-plugin/.env"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+}
+
+# 禁止ではない、ドットで始まるファイルとディレクトリは、警告だけで止めない(.htaccess と .well-known は dir のときだけ警告も出さない).
+test_other_dotfiles_only_warn() {
+	need_real_wp || return 0
+	mk_docroot z15
+	echo 1 > "${P}/.gitkeep"
+	echo 1 > "${P}/.htaccess"
+	mkdir -p "${P}/.hidden" "${P}/assets/.cache"
+	echo 1 > "${P}/.hidden/x.txt"
+	echo 1 > "${P}/assets/.cache/y.txt"
+	gcommit "dotfiles"
+	run_tool my-plugin
+	assert_rc 0
+	assert_has "警告: ドットで始まるファイル・ディレクトリが入っています"
+	assert_has "my-plugin/.gitkeep"
+	assert_has "my-plugin/.htaccess"
+	assert_has "my-plugin/.hidden"
+	assert_has "my-plugin/assets/.cache"
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+}
+
+test_htaccess_and_well_known_are_fine_in_a_dir() {
+	need_real_wp || return 0
+	mk_docroot z16
+	echo 'Options -Indexes' > lp/.htaccess
+	mkdir -p lp/.well-known && echo 'Contact: x' > lp/.well-known/security.txt
+	gcommit "htaccess"
+	run_tool landing
+	assert_rc 0
+	assert_lacks "警告:"   # 直下の内訳には .htaccess が出るので、警告の有無だけを見る
+	local z="${OUTD}/landing.2.0.0.zip"
+	zip_has "${z}" "landing/.htaccess" || fail ".htaccess が入っていません"
+	zip_has "${z}" "landing/.well-known/security.txt" || fail ".well-known/security.txt が入っていません"
+	# dir でも、ほかのドットのファイルは警告する.
+	echo 1 > lp/.gitkeep; gcommit "gitkeep"; bump_lp 2.0.1
+	run_tool landing
+	assert_rc 0
+	assert_has "landing/.gitkeep"
 }
 
 test_second_run_stops_because_tag_and_zip_exist() {

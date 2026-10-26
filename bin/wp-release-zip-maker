@@ -662,12 +662,12 @@ human_size() {
 }
 
 # Git の ref($3)の時点の対象ディレクトリから Zip を作る. 作業ツリーは使わない(未追跡・無視されたファイルは入らない).
-#   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(コミットのハッシュ) / $4 = 出力する Zip のパス
+#   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(コミットのハッシュ) / $4 = 出力する Zip のパス / $5 = 種類(plugin・theme・dir)
 # 手順: git archive で一時ディレクトリ/<スラッグ>/ へ展開 → wp dist-archive(.distignore を適用して zip) → 中身の確認.
 # 一時ディレクトリの名前を実パスにするのは、シンボリックリンクを含むと dist-archive が別の経路(コピー)に入るため.
 # 一時ディレクトリの下をスラッグと同じ名前にするのは、Zip の一番上のフォルダー名をスラッグにするため.
 make_zip() {
-	local slug="$1" path="$2" ref="$3" zip_file="$4"
+	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5"
 	local tree_path dest st wp_out wp_rc
 
 	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う). PREFIX は cmd_build が埋める.
@@ -702,7 +702,7 @@ make_zip() {
 ${wp_out}"
 	fi
 
-	verify_zip "${slug}" "${zip_file}"
+	verify_zip "${slug}" "${zip_file}" "${kind}"
 	warn_non_ascii_names "${dest}"
 }
 
@@ -721,12 +721,12 @@ warn_non_ascii_names() {
 	fi
 }
 
-# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること. unzip が無ければ確認を省く.
-#   $1 = スラッグ / $2 = Zip のパス
+# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること・配布してはいけないファイルが無いこと. unzip が無ければ確認を省く.
+#   $1 = スラッグ / $2 = Zip のパス / $3 = 種類(plugin・theme・dir)
 verify_zip() {
-	local slug="$1" zip_file="$2"
+	local slug="$1" zip_file="$2" kind="$3" found stops warns n
 	if ! command -v unzip >/dev/null 2>&1; then
-		err "警告: unzip が無いので、Zip の中身の確認を省きました."
+		err "警告: unzip が無いので、Zip の中身の確認(スラッグのフォルダー・配布してはいけないファイルの検査)を省きました. 中身を自分で確かめてから使ってください."
 		return 0
 	fi
 	# スラッグに正規表現の記号(ドット)があっても安全なよう、awk の index() で前方一致を見る.
@@ -735,10 +735,74 @@ verify_zip() {
 		rm -f -- "${zip_file}"
 		die "Zip の中に、${slug}/ の外のファイルがあります(Zip は消しました). dist-archive の動作が想定と違います."
 	fi
-	# 設定ファイルが対象の中にある構成(プラグイン 1 つ型)で、.distignore に書き忘れると、Zip に入って配布される.
-	if unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/${CONFIG_NAME}"; then
-		err "警告: Zip に ${slug}/${CONFIG_NAME}(このツールの設定)が入っています. 配布するものではないので、.distignore に ${CONFIG_NAME} を足してください."
+
+	# 配布してはいけないファイル(止める)と、ドットで始まるファイル(警告). 判定は scan_zip_names の説明を参照.
+	found="$(unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | scan_zip_names "${kind}")"
+	stops="$(printf '%s\n' "${found}" | sed -n 's/^S	//p')"
+	warns="$(printf '%s\n' "${found}" | sed -n 's/^W	//p' | LC_ALL=C sort -u)"
+	if [ -n "${stops}" ]; then
+		rm -f -- "${zip_file}"
+		n="$(printf '%s\n' "${stops}" | wc -l)"
+		n=$((n))
+		err "${PROG}: Zip に、配布してはいけないファイルが ${n} 個入っています(Zip は消しました):"
+		printf '%s\n' "${stops}" | head -n 50 | sed 's/^/  /' >&2
+		[ "${n}" -le 50 ] || err "  ... ほか $((n - 50)) 個"
+		err "秘密情報(.env・wp-config.php・秘密鍵)・DB ダンプ・バックアップ・.git・このツールの設定(${CONFIG_NAME})など、配布してはいけない名前です. 例外はありません."
+		err "Zip に入れないなら、対象の .distignore に書いて、コミットしてください."
+		exit "${EXIT_STOP}"
 	fi
+	if [ -n "${warns}" ]; then
+		n="$(printf '%s\n' "${warns}" | wc -l)"
+		n=$((n))
+		err "警告: ドットで始まるファイル・ディレクトリが入っています(${n} 件). 秘密や作業用のものでなければ、そのままで構いません. 不要なら .distignore に書いてください:"
+		printf '%s\n' "${warns}" | head -n 20 | sed 's/^/  /' >&2
+		[ "${n}" -le 20 ] || err "  ... ほか $((n - 20)) 件"
+	fi
+}
+
+# Zip のファイル名(1 行に 1 つ・印字できないバイトは '?' にそろえてある)を標準入力から読み、問題のあるものを標準出力へ出す.
+#   $1 = 種類(plugin・theme・dir)
+# 出力の形: "S<タブ>パス"(止めるもの)・"W<タブ>パス"(警告するもの). 大文字小文字は区別しない(ASCII のみ).
+# 止めるもの(通常のファイルだけを見る. 例外はなく、外すには .distignore に書く):
+#   名前が .env・.env.*・wp-config.php・id_rsa/id_ed25519/id_ecdsa/id_dsa・.htpasswd・.npmrc・.netrc・.git-credentials・.DS_Store・設定ファイル(CONFIG_NAME)
+#   拡張子が .pem・.key・.p12・.pfx(秘密鍵)・.sql・.sql.gz・.dump(DB ダンプ)・.bak・.orig・.swp・末尾が ~(バックアップ・エディターの残り)
+#   パスの途中に .git・.svn のディレクトリがある
+# 警告するもの: 上に当たらない、ドットで始まるファイル・ディレクトリ(一番上のスラッグのフォルダーは除く). 次は警告しない:
+#   dir のときの .htaccess・.well-known(配布物そのものであることが多い). 同じディレクトリの下の複数のファイルは、そのディレクトリ 1 件にまとめる
+scan_zip_names() {
+	LC_ALL=C awk -v kind="$1" -v cfg="${CONFIG_NAME}" '
+		function lower(s) { return tolower(s) }
+		function endswith(s, t) { return length(s) >= length(t) && substr(s, length(s) - length(t) + 1) == t }
+		function forbidden(b) {
+			if (b == ".env" || index(b, ".env.") == 1 || b == "wp-config.php" || b == ".htpasswd" || b == ".npmrc" || b == ".netrc" || b == ".git-credentials" || b == ".ds_store") return 1
+			if (b == "id_rsa" || b == "id_ed25519" || b == "id_ecdsa" || b == "id_dsa" || b == lower(cfg)) return 1
+			if (endswith(b, ".pem") || endswith(b, ".key") || endswith(b, ".p12") || endswith(b, ".pfx")) return 1
+			if (endswith(b, ".sql") || endswith(b, ".sql.gz") || endswith(b, ".dump")) return 1
+			if (endswith(b, ".bak") || endswith(b, ".orig") || endswith(b, ".swp") || endswith(b, "~")) return 1
+			return 0
+		}
+		{
+			name = $0
+			isdir = (name ~ /\/$/)
+			n = split(name, parts, "/")
+			split(lower(name), lp, "/")
+			last = isdir ? n - 1 : n
+			stop = 0
+			if (!isdir) {
+				if (forbidden(lp[last])) stop = 1
+				for (i = 2; i < last; i++) if (lp[i] == ".git" || lp[i] == ".svn") stop = 1
+			}
+			if (stop) { print "S\t" name; next }
+			# 警告: スラッグのフォルダー(1 つ目)の下で、最初にドットで始まる部品(免除されるものを除く)
+			path = parts[1]
+			for (i = 2; i <= last; i++) {
+				path = path "/" parts[i]
+				if (substr(lp[i], 1, 1) != ".") continue
+				if (kind == "dir" && (lp[i] == ".htaccess" || lp[i] == ".well-known")) continue
+				print "W\t" path
+				break
+			}
+		}'
 }
 
 # 作った Zip の要約を出す(ファイル数・サイズ・SHA-256・一番上のフォルダーの直下の内訳).
@@ -1035,7 +1099,7 @@ cmd_build() {
 	# --- 実行 ----------------------------------------------------------------------------------
 	if [ "${rebuild}" -eq 1 ]; then
 		printf '%s (%s) を作り直します: 版 %s・%s(コミット %s)\n' "${slug}" "${kind}" "${ver}" "${refdesc}" "${short}"
-		make_zip "${slug}" "${path}" "${ref}" "${zip_file}"
+		make_zip "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}"
 		printf '\n'
 		print_zip_summary "${slug}" "${zip_file}"
 		check_rebuild_digest "${tag}" "${zip_file}" "${allow_change}"
@@ -1044,7 +1108,7 @@ cmd_build() {
 	fi
 
 	printf '%s (%s) を作ります: 版 %s・HEAD %s\n' "${slug}" "${kind}" "${ver}" "${short}"
-	make_zip "${slug}" "${path}" "${ref}" "${zip_file}"
+	make_zip "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}"
 	# タグを打てなければ、Zip も消す(「タグの無い Zip」を残すと、次回の実行が止まるため).
 	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}"; then
 		rm -f -- "${zip_file}"
