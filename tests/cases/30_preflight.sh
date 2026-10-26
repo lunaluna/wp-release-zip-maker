@@ -334,4 +334,20 @@ test_rebuild_checks_the_state_at_the_tag() {
 	LABEL="check が食い違う"; pf my-plugin --rebuild 1.4.0 --dry-run; assert_rc 1; assert_has "タグ my-plugin/1.4.0 の"; assert_has "版の表記がそろっていません"
 }
 
+# --list(作業ツリーから読む)と --dry-run(Git の HEAD から読む)が、すべての種類で同じ版を読むこと.
+# 版の読み方は 1 つの実装を、読み出し元(作業ツリー・Git の ref)の違いだけ変えて共有している. どちらかだけが変わる事故を防ぐ.
+# 作業ツリーはきれいなので、2 つの読み元の内容は同じになる.
+test_list_and_dry_run_read_the_same_version() {
+	pf_setup same1
+	local slug v_list v_dry
+	for slug in my-plugin my-theme landing; do
+		run_tool --list
+		v_list="$(printf '%s\n' "${OUT}" | awk -v s="${slug}" '$2 == s { print $3 }')"
+		pf "${slug}" --dry-run
+		v_dry="$(printf '%s\n' "${OUT}" | sed -n 's/^版: *\([^ ]*\) .*$/\1/p')"
+		[ -n "${v_list}" ] || fail "${slug}: --list の版を読めません"
+		assert_eq "${v_list}" "${v_dry}" "${slug} の版(--list と --dry-run)"
+	done
+}
+
 tests_main "$@"

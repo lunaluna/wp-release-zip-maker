@@ -5,15 +5,6 @@
 # shellcheck source=../lib.sh
 source "$(dirname "$0")/../lib.sh"
 
-# 実物の wp dist-archive が無ければ、このテストを飛ばす. 使い方: need_real_wp || return 0
-need_real_wp() {
-	if have_dist_archive; then
-		return 0
-	fi
-	skip "実物の wp dist-archive・zip・unzip が無い"
-	return 1
-}
-
 # Zip のファイル名一覧から、一番上のフォルダー名だけを重複なしで出す.
 top_folders() {
 	zip_names "$1" | sed 's#/.*##' | LC_ALL=C sort -u | tr '\n' ' '

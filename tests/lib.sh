@@ -169,6 +169,7 @@ zip_cat() {
 	unzip -p "$1" "$2" 2>/dev/null
 }
 
+# ファイルの SHA-256(64 桁の 16 進数). ツールの sha256_of と似た処理だが、意図して実装に頼らず、テスト側で独立に計算する(期待値の元を、実装と分けるため).
 sha256_file() {
 	if command -v shasum >/dev/null 2>&1; then
 		shasum -a 256 "$1" | cut -d' ' -f1
@@ -180,6 +181,15 @@ sha256_file() {
 # 実物の `wp dist-archive` があるか(Zip を実際に作るテストの前提).
 have_dist_archive() {
 	command -v wp >/dev/null 2>&1 && wp dist-archive --help >/dev/null 2>&1 && command -v zip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1
+}
+
+# 実物の wp dist-archive が無ければ、そのテストを飛ばす(SKIP にする). 使い方(テストの先頭): need_real_wp || return 0
+need_real_wp() {
+	if have_dist_archive; then
+		return 0
+	fi
+	skip "実物の wp dist-archive・zip・unzip が無い"
+	return 1
 }
 
 # 偽の wp を作る. dist-archive --help には成功で答え、それ以外は第 2 引数のシェルのコード($@ が使える)を実行する.

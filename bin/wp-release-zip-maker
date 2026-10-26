@@ -375,54 +375,106 @@ version_source() {
 	esac
 }
 
-# ファイルの先頭 $2 バイトから「Version: x」の x を 1 つ取り出す(WordPress のヘッダーと同じ読み方).
-# 行頭の空白・'*'・'#'・'@' は読み飛ばす(docblock の ' * Version: 1.0' に対応).
-header_version() {
-	head -c "$2" "$1" | sed -n 's/^[[:space:]*#@]*Version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1
+# --- 版の読み取り -------------------------------------------------------------------------------
+#
+# 版は、読み出し元が作業ツリーでも Git の ref でも、同じ規則で読む(規則を 1 か所にして、片方だけ直す事故を防ぐ).
+# 元の違いは、次の 3 つの入口(src_*)にだけ閉じ込める. 引数の形は共通で、
+#   $1 = 元の種類("dir" = 作業ツリーのディレクトリ / "ref" = Git の ref の時点)
+#   $2 = dir なら対象のディレクトリ(絶対パス)/ ref なら ref
+#   $3 = ref のときの、Git のルートからの対象のパス(dir のときは使わない)
+#   $4 = 対象のディレクトリの直下のファイル名(src_has_file・src_cat のみ)
+# 使う側: --list は作業ツリー(read_version)・Zip の作成・--rebuild は ref(read_version_at・version_file_at).
+
+# 元の直下に、その名前のファイルがあるか.
+src_has_file() {
+	case "$1" in
+		dir) [ -f "$2/$4" ] ;;
+		ref) git -C "${GIT_TOP}" cat-file -e "$2:${3:+${3}/}$4" 2>/dev/null ;;
+	esac
 }
 
-# 版を読むファイルの絶対パスを標準出力へ出す. 見つからなければ何も出さず 1 を返す.
-#   $1 = 種類 / $2 = 対象のディレクトリ(絶対パス)
-version_file() {
-	local kind="$1" dir="$2" f
+# 元の直下のファイルの内容を標準出力へ出す.
+src_cat() {
+	case "$1" in
+		dir) cat -- "$2/$4" ;;
+		ref) git -C "${GIT_TOP}" cat-file blob "$2:${3:+${3}/}$4" ;;
+	esac
+}
+
+# 元の直下の *.php の名前を、NUL 区切りで標準出力へ出す.
+# dir はシェルの並び・ref は Git の名前順. -z: ASCII 以外のファイル名が引用符つきで出るのを避ける.
+src_php_names() {
+	local f
+	case "$1" in
+		dir)
+			for f in "$2"/*.php; do
+				[ -f "${f}" ] && printf '%s\0' "${f##*/}"
+			done
+			;;
+		ref)
+			while IFS= read -r -d '' f; do
+				case "${f}" in
+					*.php) printf '%s\0' "${f}" ;;
+				esac
+			done < <(git -C "${GIT_TOP}" ls-tree -z --name-only "$2:$3" 2>/dev/null)
+			;;
+	esac
+	return 0
+}
+
+# 標準入力の先頭 $1 バイトから「Version: x」の x を 1 つ取り出す(WordPress のヘッダーと同じ読み方).
+# 行頭の空白・'*'・'#'・'@' は読み飛ばす(docblock の ' * Version: 1.0' に対応).
+header_version() {
+	head -c "$1" | sed -n 's/^[[:space:]*#@]*Version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1
+}
+
+# 版を読むファイルの名前(対象のディレクトリの中での名前)を標準出力へ出す. 見つからなければ何も出さず 1 を返す.
+#   $1 = 種類 / $2〜$4 = 元(src_* の $1〜$3 と同じ: 元の種類・dir か ref・ref のときのパス)
+version_file_in() {
+	local kind="$1" name
 	case "${kind}" in
 		theme)
-			[ -f "${dir}/style.css" ] || return 1
-			printf '%s' "${dir}/style.css"
-			;;
-		plugin)
-			# WordPress は Plugin Name: を先頭 8KB から探す. 同じ階層の php を名前順に見て、最初に見つかったものを使う.
-			for f in "${dir}"/*.php; do
-				[ -f "${f}" ] || continue
-				if head -c 8192 "${f}" | grep -q '^[[:space:]*#@]*Plugin Name:'; then
-					printf '%s' "${f}"
-					return 0
-				fi
-			done
-			return 1
+			src_has_file "$2" "$3" "$4" style.css || return 1
+			printf '%s' "style.css"
 			;;
 		dir)
-			[ -f "${dir}/VERSION" ] || return 1
-			printf '%s' "${dir}/VERSION"
+			src_has_file "$2" "$3" "$4" VERSION || return 1
+			printf '%s' "VERSION"
+			;;
+		plugin)
+			# WordPress は Plugin Name: を先頭 8KB から探す. 同じ階層の php を順に見て、最初に見つかったものを使う.
+			while IFS= read -r -d '' name; do
+				if src_cat "$2" "$3" "$4" "${name}" 2>/dev/null | head -c 8192 | grep -q '^[[:space:]*#@]*Plugin Name:'; then
+					printf '%s' "${name}"
+					return 0
+				fi
+			done < <(src_php_names "$2" "$3" "$4")
+			return 1
 			;;
 	esac
 }
 
-# 対象の版を読んで標準出力へ出す. 読めなければ何も出さず 1 を返す.
-#   $1 = 種類 / $2 = 対象のディレクトリ(絶対パス)
-read_version() {
-	local kind="$1" dir="$2" v="" f
-	f="$(version_file "${kind}" "${dir}")" || return 1
+# 版を読んで標準出力へ出す. 読めなければ何も出さず 1 を返す.
+#   $1 = 種類 / $2〜$4 = 元(version_file_in と同じ)
+read_version_in() {
+	local kind="$1" name v=""
+	name="$(version_file_in "$@")" || return 1
 	case "${kind}" in
-		theme) v="$(header_version "${f}" 5000)" ;;
-		plugin) v="$(header_version "${f}" 8192)" ;;
+		theme) v="$(src_cat "$2" "$3" "$4" "${name}" | header_version 5000)" ;;
+		plugin) v="$(src_cat "$2" "$3" "$4" "${name}" | header_version 8192)" ;;
 		dir)
-			IFS= read -r v <"${f}" || true
+			v="$(src_cat "$2" "$3" "$4" "${name}" | head -n 1)"
 			v="$(trim "${v}")"
 			;;
 	esac
 	[ -n "${v}" ] || return 1
 	printf '%s' "${v}"
+}
+
+# 作業ツリーの対象の版(--list 用). 読めなければ何も出さず 1 を返す.
+#   $1 = 種類 / $2 = 対象のディレクトリ(絶対パス)
+read_version() {
+	read_version_in "$1" dir "$2" ""
 }
 
 # タグ名を作る. $1 = スラッグ / $2 = 版.
@@ -925,60 +977,16 @@ blob_cat() {
 	git -C "${GIT_TOP}" show "${1}:${PREFIX}${2}" 2>/dev/null
 }
 
-# 標準入力の先頭 $1 バイトから「Version: x」の x を 1 つ取り出す(header_version と同じ読み方).
-header_version_stdin() {
-	head -c "$1" | sed -n 's/^[[:space:]*#@]*Version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1
-}
-
 # ref の時点で、版を読むファイルの名前(対象のディレクトリの中での名前)を標準出力へ出す. 無ければ 1 を返す.
 #   $1 = 種類 / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref
 version_file_at() {
-	local kind="$1" path="$2" ref="$3" tp name
-	tp="$(tree_path_of "${path}")"
-	case "${kind}" in
-		theme)
-			git -C "${GIT_TOP}" cat-file -e "${ref}:${tp:+${tp}/}style.css" 2>/dev/null || return 1
-			printf '%s' "style.css"
-			;;
-		dir)
-			git -C "${GIT_TOP}" cat-file -e "${ref}:${tp:+${tp}/}VERSION" 2>/dev/null || return 1
-			printf '%s' "VERSION"
-			;;
-		plugin)
-			# 直下の *.php のうち、Plugin Name: を先頭 8KB に持つ最初のファイル(Git の名前順).
-			# -z: ASCII 以外のファイル名が引用符つきで出るのを避ける.
-			while IFS= read -r -d '' name; do
-				case "${name}" in
-					*.php) ;;
-					*) continue ;;
-				esac
-				if git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" 2>/dev/null |
-					head -c 8192 | grep -q '^[[:space:]*#@]*Plugin Name:'; then
-					printf '%s' "${name}"
-					return 0
-				fi
-			done < <(git -C "${GIT_TOP}" ls-tree -z --name-only "${ref}:${tp}" 2>/dev/null)
-			return 1
-			;;
-	esac
+	version_file_in "$1" ref "$3" "$(tree_path_of "$2")"
 }
 
 # ref の時点の版を標準出力へ出す. 読めなければ何も出さず 1 を返す.
 #   $1 = 種類 / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref
 read_version_at() {
-	local kind="$1" path="$2" ref="$3" tp name v=""
-	name="$(version_file_at "${kind}" "${path}" "${ref}")" || return 1
-	tp="$(tree_path_of "${path}")"
-	case "${kind}" in
-		theme) v="$(git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" | header_version_stdin 5000)" ;;
-		plugin) v="$(git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" | header_version_stdin 8192)" ;;
-		dir)
-			v="$(git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" | head -n 1)"
-			v="$(trim "${v}")"
-			;;
-	esac
-	[ -n "${v}" ] || return 1
-	printf '%s' "${v}"
+	read_version_in "$1" ref "$3" "$(tree_path_of "$2")"
 }
 
 # --- build / --dry-run / --rebuild --------------------------------------------------------------

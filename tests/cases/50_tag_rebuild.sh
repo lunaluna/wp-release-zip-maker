@@ -4,15 +4,8 @@
 # shellcheck source=../lib.sh
 source "$(dirname "$0")/../lib.sh"
 
-need_real_wp() {
-	if have_dist_archive; then
-		return 0
-	fi
-	skip "実物の wp dist-archive・zip・unzip が無い"
-	return 1
-}
-
 # タグのメッセージの中の、見出し($2)の値を出す(例: SHA-256). $1 = タグ名.
+# ツールの tag_recorded_field と似た処理だが、意図して実装に頼らず、テスト側で独立に読む(同じ誤りを、実装とテストが同時に持たないため).
 tag_field() {
 	git tag -l --format='%(contents)' "$1" | sed -n "s/^$2: *//p" | head -n 1
 }

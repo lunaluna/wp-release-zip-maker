@@ -5,14 +5,6 @@
 # shellcheck source=../lib.sh
 source "$(dirname "$0")/../lib.sh"
 
-need_real_wp() {
-	if have_dist_archive; then
-		return 0
-	fi
-	skip "実物の wp dist-archive・zip・unzip が無い"
-	return 1
-}
-
 # lp(スラッグ landing)を、版 $1 に上げてコミットし、Zip を作る(タグも打たれる).
 release_lp() {
 	bump_lp "$1"
