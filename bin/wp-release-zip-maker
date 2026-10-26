@@ -1010,6 +1010,7 @@ cmd_build() {
 		printf '\n'
 		print_zip_summary "${slug}" "${zip_file}"
 		report_rebuild_sha "${tag}" "${zip_file}"
+		print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 		return 0
 	fi
 
@@ -1024,6 +1025,7 @@ cmd_build() {
 	print_zip_summary "${slug}" "${zip_file}"
 	printf '\nタグ:       %s を打ちました(注釈付き・コミット %s).\n' "${tag}" "${short}"
 	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
+	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 }
 
 # --rebuild で作り直した Zip を、タグに記録された値と比べて表示する(一致しなくても止めない).
@@ -1049,6 +1051,103 @@ report_rebuild_sha() {
 	recorded="$(tag_recorded_field "${tag}" "SHA-256")"
 	if [ -n "${recorded}" ]; then
 		printf '  (Zip 全体の SHA-256 は、作り直すたびに変わります. 配布した Zip の現物は、タグに記録された SHA-256 と照合してください: %s)\n' "${recorded}"
+	fi
+}
+
+# --- アップロードの手順の表示 -------------------------------------------------------------------
+
+# 同じスラッグの、タグ $2 の 1 つ前のタグの版を標準出力へ出す. 前のタグが無ければ何も出さず 1 を返す.
+#   $1 = スラッグ / $2 = 基準にするタグ名(すでにあること)
+# タグは git の version:refname の並び(1.9.0 < 1.10.0)で並べ、tag_format の {version} の前後を削って版にする.
+# 注意: tag_format が {version} だけ(対象が 1 つのリポジトリ)のときは、リポジトリのすべてのタグが対象になる.
+# 版の形でないタグ(release-2024 など)が混ざっていると、そのタグを前の版と見なすことがある.
+previous_version() {
+	local slug="$1" cur_tag="$2" pattern prefix suffix t prev="" found=0 v
+	pattern="$(make_tag "${slug}" '*')"
+	while IFS= read -r t; do
+		if [ "${t}" = "${cur_tag}" ]; then
+			found=1
+			break
+		fi
+		prev="${t}"
+	done < <(git -C "${GIT_TOP}" tag -l --sort=version:refname "${pattern}")
+	{ [ "${found}" -eq 1 ] && [ -n "${prev}" ]; } || return 1
+	prefix="${CFG_TAG_FORMAT%%\{version\}*}"
+	prefix="${prefix//\{slug\}/${slug}}"
+	suffix="${CFG_TAG_FORMAT#*\{version\}}"
+	suffix="${suffix//\{slug\}/${slug}}"
+	v="${prev#"${prefix}"}"
+	v="${v%"${suffix}"}"
+	valid_version "${v}" || return 1
+	printf '%s' "${v}"
+}
+
+# 作った(作り直した)Zip を、サーバーへ上げる手順を表示する.
+#   $1 = 種類 / $2 = スラッグ / $3 = 版 / $4 = タグ名 / $5 = Zip のパス
+# theme・plugin は管理画面の Zip アップロード. dir は SSH(scp + unzip + mv)の手順を、版とパスを埋めて出す.
+# shellcheck disable=SC2016  # 表示する手順の中の $DOCROOT と $z などは、展開せずにそのまま出す(サーバーで展開される).
+print_deploy_hint() {
+	local kind="$1" slug="$2" ver="$3" tag="$4" zip_file="$5" prev bak has_version name
+	case "${kind}" in
+		theme | plugin)
+			printf '\nアップロード: 管理画面の「%s」から、この Zip(%s)を上げます.\n' \
+				"$([ "${kind}" = "theme" ] && echo 'テーマの追加 > テーマのアップロード' || echo 'プラグインの追加 > プラグインのアップロード')" "$(basename "${zip_file}")"
+			printf '            Zip の一番上のフォルダー(%s)が、置き換わる対象を決めます.\n' "${slug}"
+			return 0
+			;;
+	esac
+
+	# dir: 前の版(同じスラッグの 1 つ前のタグ). 無ければ、退避先の名前に版を付けない.
+	if prev="$(previous_version "${slug}" "${tag}")"; then
+		bak="${slug}.bak-${prev}"
+	else
+		prev=""
+		bak="${slug}.bak"
+	fi
+	name="${slug}.${ver}"
+	# Zip に VERSION が入っているか(サーバーで版を確かめる行を出せるか).
+	has_version=0
+	if command -v unzip >/dev/null 2>&1 && unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/VERSION"; then
+		has_version=1
+	fi
+
+	printf '\n--- アップロードの手順(SSH)---\n'
+	printf 'user@host・/path/to/public_html は、自分の環境に置き換える. サーバーの手順は 1 行ずつ確かめながら実行する.\n'
+	printf '旧版は、docroot の外(~/releases)へ退避する(docroot の中に置くと、古い版が URL で見えてしまう).\n'
+	printf '展開は上書きではなく、新しいディレクトリへ展開して差し替える(新しい版で消したファイルが残らないように).\n'
+	printf '\n(ローカル)\n'
+	printf "ssh user@host 'mkdir -p ~/releases'\n"
+	printf 'scp %s user@host:~/releases/\n' "${zip_file}"
+	printf '\n(サーバー)\n'
+	printf '# unzip があるか. 無ければ、下の「unzip が無いとき」を使う\n'
+	printf 'which unzip\n'
+	printf '# %s を置く親のディレクトリ(サーバーでの名前が %s と違うなら、mv の行き先を変える)\n' "${slug}" "${slug}"
+	printf 'DOCROOT=/path/to/public_html\n'
+	printf '# 同じディスクか. 別だと mv がコピーになり、その間ページが無くなる\n'
+	printf 'df ~/releases "$DOCROOT"\n'
+	printf 'cd ~/releases\n'
+	printf '# 新しいディレクトリへ展開する(→ ~/releases/%s/%s/)\n' "${name}" "${slug}"
+	printf 'unzip -q %s.zip -d %s\n' "${name}" "${name}"
+	if [ "${has_version}" -eq 1 ]; then
+		printf '# 版を確かめる(%s のはず)\n' "${ver}"
+		printf 'cat %s/%s/VERSION\n' "${name}" "${slug}"
+	fi
+	printf '# 旧版を docroot の外へ退避する(初回で旧版が無いときは、この行を飛ばす)\n'
+	printf 'mv "$DOCROOT/%s" ~/releases/%s\n' "${slug}" "${bak}"
+	printf '# 新しい版を置く\n'
+	printf 'mv %s/%s "$DOCROOT/%s"\n' "${name}" "${slug}" "${slug}"
+	if [ "${has_version}" -eq 1 ]; then
+		printf 'cat "$DOCROOT/%s/VERSION"\n' "${slug}"
+	fi
+	printf '\n(戻すとき)\n'
+	printf 'mv "$DOCROOT/%s" ~/releases/%s.failed-%s && mv ~/releases/%s "$DOCROOT/%s"\n' "${slug}" "${slug}" "${ver}" "${bak}" "${slug}"
+	printf '\n(unzip が無いとき: 上の unzip -q の行の代わりに)\n'
+	printf "php -r '\$z=new ZipArchive;\$z->open(\$argv[1]);\$z->extractTo(\$argv[2]);' %s.zip %s\n" "${name}" "${name}"
+	if [ "${has_version}" -eq 0 ]; then
+		err "警告: Zip に ${slug}/VERSION が入っていないので、サーバーで版を確かめる行を省きました. .distignore から VERSION を外すことを勧めます."
+	fi
+	if [ -z "${prev}" ]; then
+		err "メモ: 同じスラッグの前のタグが無いので、退避先の名前は ${bak} にしました(初回のアップロードなら、旧版の退避は要りません)."
 	fi
 }
 
