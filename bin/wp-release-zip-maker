@@ -65,12 +65,19 @@ ${PROG} ${WP_RELEASE_ZIP_MAKER_VERSION}
 Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
 
 使い方:
-  ${PROG} <slug>             Zip を作り、タグを打つ
-  ${PROG} <slug> --dry-run   確認だけ(Zip もタグも作らない)
-  ${PROG} <slug> --rebuild   既存のタグから Zip を作り直す(タグは打たない)
-  ${PROG} --list             設定にある対象と、今の版・タグの有無を一覧にする
-  ${PROG} --version          ツールの版を表示する
-  ${PROG} --help             この説明を表示する
+  ${PROG} <slug>
+      HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない)
+  ${PROG} <slug> --dry-run
+      確認だけ(Zip もタグも作らない)
+  ${PROG} <slug> --rebuild [<版>]
+      既存のタグの時点から Zip だけを作り直す(タグは打たない). 版を省くと HEAD の版.
+      --dry-run と組み合わせられる
+  ${PROG} --list
+      設定にある対象と、今の版・タグの有無を一覧にする
+  ${PROG} --version
+      ツールの版を表示する
+  ${PROG} --help
+      この説明を表示する
 
 設定ファイル ${CONFIG_NAME} は、カレントディレクトリから上へ探す(Git のルートで止める).
 詳しくは README.md を参照.
@@ -80,12 +87,6 @@ EOF
 # --version の出力.
 print_version() {
 	printf '%s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
-}
-
-# まだ実装していない機能が呼ばれたときの案内. 実装が済んだ機能から順に使わなくなる.
-not_implemented() {
-	err "${PROG}: '$1' はまだ実装していません(開発中: ${WP_RELEASE_ZIP_MAKER_VERSION})."
-	exit "${EXIT_USAGE}"
 }
 
 # --- 文字列・版の小さな道具 ---------------------------------------------------------------------
@@ -515,11 +516,6 @@ rel_join() {
 	fi
 }
 
-# Git が追跡しているファイルか(設定ファイルのある場所からの相対パス).
-is_tracked() {
-	git -C "${CONFIG_DIR}" ls-files --error-unmatch -- "$1" >/dev/null 2>&1
-}
-
 # 作業ツリーがきれいか(未コミット・未追跡の変更が無いか). Zip は HEAD から作るので、汚れていれば止める.
 check_clean_tree() {
 	local status count
@@ -542,26 +538,26 @@ valid_version() {
 	return 0
 }
 
-# 対象 $1 に属する check 行のファイルを開き、版 $2 が書かれているかを確かめる(全部確かめてから結果を返す).
-# 食い違いは標準エラーに出す. 結果は CHECK_TOTAL / CHECK_BAD に入れる.
+# 対象 $1 に属する check 行のファイルを、ref($3)の時点の内容で開き、版 $2 が書かれているかを確かめる
+# (全部確かめてから結果を返す). 食い違いは標準エラーに出す. 結果は CHECK_TOTAL / CHECK_BAD に入れる.
 # 行の中に版番号があればよい. 版の前後は、英数字・ドット・ハイフン・アンダースコア・プラス以外であること
 # (1.2.3 が 11.2.30 や 1.2.3-beta に当たらないように).
 check_version_files() {
-	local idx="$1" ver="$2" i=0 f re lines rc pat shown
+	local idx="$1" ver="$2" ref="$3" i=0 content re lines rc pat shown
 	CHECK_TOTAL=0
 	CHECK_BAD=0
 	pat="(^|[^0-9A-Za-z._+-])$(printf '%s' "${ver}" | sed 's/[.+]/\\&/g')([^0-9A-Za-z._+-]|\$)"
 	while [ "${i}" -lt "${#C_PATH[@]}" ]; do
 		if path_under "${C_PATH[${i}]}" "${T_PATH[${idx}]}"; then
 			CHECK_TOTAL=$((CHECK_TOTAL + 1))
-			f="${CONFIG_DIR}/${C_PATH[${i}]}"
 			re="${C_REGEX[${i}]}"
-			if [ ! -f "${f}" ]; then
-				err "  ${C_PATH[${i}]}: ファイルがありません"
+			if ! blob_exists "${ref}" "${C_PATH[${i}]}"; then
+				err "  ${C_PATH[${i}]}: ファイルがありません(コミット済みのものを確かめます)"
 				CHECK_BAD=$((CHECK_BAD + 1))
 			else
+				content="$(blob_cat "${ref}" "${C_PATH[${i}]}")"
 				# grep の終了コード: 0 = 一致あり / 1 = 一致なし / 2 = 正規表現の誤りなど.
-				lines="$(grep -E -- "${re}" "${f}" 2>/dev/null)"
+				lines="$(printf '%s\n' "${content}" | grep -E -- "${re}" 2>/dev/null)"
 				rc=$?
 				if [ "${rc}" -ge 2 ]; then
 					err "  ${C_PATH[${i}]}: 正規表現 '${re}' が不正です"
@@ -593,15 +589,38 @@ cleanup_tmp() {
 	fi
 }
 
-# ファイルの SHA-256 を標準出力へ出す(macOS は shasum・Linux は sha256sum・どちらも無ければ openssl).
-sha256_of() {
+# 標準入力の SHA-256 を標準出力へ出す(macOS は shasum・Linux は sha256sum・どちらも無ければ openssl).
+sha256_stdin() {
 	if command -v shasum >/dev/null 2>&1; then
-		shasum -a 256 "$1" | awk '{print $1}'
+		shasum -a 256 | awk '{print $1}'
 	elif command -v sha256sum >/dev/null 2>&1; then
-		sha256sum "$1" | awk '{print $1}'
+		sha256sum | awk '{print $1}'
 	else
-		openssl dgst -sha256 -r "$1" | awk '{print $1}'
+		openssl dgst -sha256 -r | awk '{print $1}'
 	fi
+}
+
+# ファイルの SHA-256 を標準出力へ出す.
+sha256_of() {
+	sha256_stdin <"$1"
+}
+
+# Zip の「内容の指紋」を標準出力へ出す. unzip が無い・読めなければ何も出さず 1 を返す.
+# 中身は、ファイルごとの「CRC-32 と名前」を並べ替えて SHA-256 にしたもの(時刻・属性・圧縮のしかたを含まない).
+# Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため. 2026-10-26 に確認).
+# 内容が同じかどうかは、この指紋で比べる. 名前の ASCII 以外のバイトは、unzip が一部を落とす/不正な形で出すので '?' にそろえる.
+zip_content_digest() {
+	local out
+	command -v unzip >/dev/null 2>&1 || return 1
+	# unzip -v の行: 長さ 方式 圧縮後 圧縮率 日付 時刻 CRC-32 名前(名前は空白を含みうる). 7 語を取り除いた残りが名前.
+	out="$(unzip -v "$1" 2>/dev/null | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk '
+		$7 ~ /^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]$/ {
+			crc = $7; name = $0
+			for (i = 0; i < 7; i++) sub(/^ *[^ ]+ */, "", name)
+			if (name !~ /\/$/) print crc " " name
+		}' | LC_ALL=C sort)"
+	[ -n "${out}" ] || return 1
+	printf '%s\n' "${out}" | sha256_stdin
 }
 
 # バイト数を読みやすい単位にして標準出力へ出す.
@@ -614,21 +633,16 @@ human_size() {
 }
 
 # Git の ref($3)の時点の対象ディレクトリから Zip を作る. 作業ツリーは使わない(未追跡・無視されたファイルは入らない).
-#   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(HEAD またはタグ名) / $4 = 出力する Zip のパス
+#   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(コミットのハッシュ) / $4 = 出力する Zip のパス
 # 手順: git archive で一時ディレクトリ/<スラッグ>/ へ展開 → wp dist-archive(.distignore を適用して zip) → 中身の確認.
 # 一時ディレクトリの名前を実パスにするのは、シンボリックリンクを含むと dist-archive が別の経路(コピー)に入るため.
 # 一時ディレクトリの下をスラッグと同じ名前にするのは、Zip の一番上のフォルダー名をスラッグにするため.
 make_zip() {
 	local slug="$1" path="$2" ref="$3" zip_file="$4"
-	local prefix tree_path dest st wp_out wp_rc
+	local tree_path dest st wp_out wp_rc
 
-	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う).
-	prefix="$(git -C "${CONFIG_DIR}" rev-parse --show-prefix)" || die "Git のルートからの位置を取得できません."
-	if [ "${path}" = "." ]; then
-		tree_path="${prefix%/}"
-	else
-		tree_path="${prefix}${path}"
-	fi
+	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う). PREFIX は cmd_build が埋める.
+	tree_path="$(tree_path_of "${path}")"
 
 	TMP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/wp-release-zip-maker.XXXXXX")" || die "一時ディレクトリを作れません."
 	TMP_WORK="$(cd "${TMP_WORK}" && pwd -P)"
@@ -717,66 +731,231 @@ print_zip_summary() {
 	fi
 }
 
-# 「build」と「--dry-run」の事前の確認. すべて通れば、--dry-run は要約を出して終わる.
-# 組み合わせ表(プラン)の「通常」の列の「止める」を、この順に確かめる:
-#   道具 → コミットの有無 → 対象と .distignore → 作業ツリー → 版と check → タグ → 出力先の Zip
+# --- タグ ---------------------------------------------------------------------------------------
+
+# コミッターの名前・メールが決まっているか(注釈付きタグを打つのに要る). 決まっていなければ止める.
+# `git var GIT_COMMITTER_IDENT` は、名前やメールを自動で決められないときに失敗する.
+check_git_identity() {
+	git -C "${CONFIG_DIR}" var GIT_COMMITTER_IDENT >/dev/null 2>&1 ||
+		die "Git のコミッターの名前・メールが決まっていません(注釈付きタグを打てません). 次を設定してください:
+  git config user.name \"あなたの名前\"
+  git config user.email \"you@example.com\""
+}
+
+# 注釈付きタグを打つ. 打てなければ非 0 を返す(Zip の後始末は呼び出し側).
+#   $1 = タグ名 / $2 = コミット / $3 = スラッグ / $4 = 版 / $5 = Zip のパス
+# メッセージ: 1 行目 = '<スラッグ> <版>'. 本文 = Zip の名前・SHA-256・内容の指紋・ツールの版.
+#   SHA-256         = 配布した Zip そのもの(バイト列)の SHA-256. 手元の Zip が配布したものと同じかを確かめるための記録.
+#   Content-SHA-256 = Zip の内容の指紋(zip_content_digest). --rebuild が、作り直した Zip の内容と比べる.
+#                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. unzip が無ければこの行は書かない.
+create_tag() {
+	local tag="$1" commit="$2" slug="$3" ver="$4" zip_file="$5" content
+	content="$(zip_content_digest "${zip_file}")" || content=""
+	{
+		printf '%s %s\n\nZip: %s\nSHA-256: %s\n' "${slug}" "${ver}" "$(basename "${zip_file}")" "$(sha256_of "${zip_file}")"
+		[ -z "${content}" ] || printf 'Content-SHA-256: %s\n' "${content}"
+		printf 'Built-with: %s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
+	} | git -C "${GIT_TOP}" tag -a -F - "${tag}" "${commit}"
+}
+
+# タグのメッセージに記録された値を標準出力へ出す(無ければ何も出さない). $1 = タグ名 / $2 = 見出し('SHA-256' など).
+# 見出しは行頭から探すので、'SHA-256' が 'Content-SHA-256' に当たることはない.
+tag_recorded_field() {
+	git -C "${GIT_TOP}" tag -l --format='%(contents)' "$1" | sed -n "s/^$2: *\\([0-9a-f]*\\).*\$/\\1/p" | head -n 1
+}
+
+# --- ref(コミット・タグ)の内容を読む -----------------------------------------------------------
+# build と --rebuild は、作業ツリーのファイルではなく、Zip の元になる ref の内容から版と check を読む
+# (--rebuild は「タグの時点で確かめる」ため. build も HEAD から読めば、Zip に入る内容と版の確認が一致する).
+
+# Git のルートから見た設定ファイルの場所('app/public/' など. ルートなら空). cmd_build が埋める.
+PREFIX=""
+
+# 対象のパス $1(設定ファイルからの相対)の、Git のルートからのパスを標準出力へ出す(末尾の / なし. ルートそのものなら空).
+tree_path_of() {
+	if [ "$1" = "." ]; then
+		printf '%s' "${PREFIX%/}"
+	else
+		printf '%s%s' "${PREFIX}" "$1"
+	fi
+}
+
+# ref の時点に、設定ファイルからの相対パス $2 のファイル(またはディレクトリ)があるか. $1 = ref.
+blob_exists() {
+	git -C "${GIT_TOP}" cat-file -e "${1}:${PREFIX}${2}" 2>/dev/null
+}
+
+# ref の時点の、設定ファイルからの相対パス $2 のファイルの中身を標準出力へ出す. $1 = ref.
+blob_cat() {
+	git -C "${GIT_TOP}" show "${1}:${PREFIX}${2}" 2>/dev/null
+}
+
+# 標準入力の先頭 $1 バイトから「Version: x」の x を 1 つ取り出す(header_version と同じ読み方).
+header_version_stdin() {
+	head -c "$1" | sed -n 's/^[[:space:]*#@]*Version:[[:space:]]*\([^[:space:]]*\).*$/\1/p' | head -n 1
+}
+
+# ref の時点で、版を読むファイルの名前(対象のディレクトリの中での名前)を標準出力へ出す. 無ければ 1 を返す.
+#   $1 = 種類 / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref
+version_file_at() {
+	local kind="$1" path="$2" ref="$3" tp name
+	tp="$(tree_path_of "${path}")"
+	case "${kind}" in
+		theme)
+			git -C "${GIT_TOP}" cat-file -e "${ref}:${tp:+${tp}/}style.css" 2>/dev/null || return 1
+			printf '%s' "style.css"
+			;;
+		dir)
+			git -C "${GIT_TOP}" cat-file -e "${ref}:${tp:+${tp}/}VERSION" 2>/dev/null || return 1
+			printf '%s' "VERSION"
+			;;
+		plugin)
+			# 直下の *.php のうち、Plugin Name: を先頭 8KB に持つ最初のファイル(Git の名前順).
+			# -z: ASCII 以外のファイル名が引用符つきで出るのを避ける.
+			while IFS= read -r -d '' name; do
+				case "${name}" in
+					*.php) ;;
+					*) continue ;;
+				esac
+				if git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" 2>/dev/null |
+					head -c 8192 | grep -q '^[[:space:]*#@]*Plugin Name:'; then
+					printf '%s' "${name}"
+					return 0
+				fi
+			done < <(git -C "${GIT_TOP}" ls-tree -z --name-only "${ref}:${tp}" 2>/dev/null)
+			return 1
+			;;
+	esac
+}
+
+# ref の時点の版を標準出力へ出す. 読めなければ何も出さず 1 を返す.
+#   $1 = 種類 / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref
+read_version_at() {
+	local kind="$1" path="$2" ref="$3" tp name v=""
+	name="$(version_file_at "${kind}" "${path}" "${ref}")" || return 1
+	tp="$(tree_path_of "${path}")"
+	case "${kind}" in
+		theme) v="$(git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" | header_version_stdin 5000)" ;;
+		plugin) v="$(git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" | header_version_stdin 8192)" ;;
+		dir)
+			v="$(git -C "${GIT_TOP}" cat-file blob "${ref}:${tp:+${tp}/}${name}" | head -n 1)"
+			v="$(trim "${v}")"
+			;;
+	esac
+	[ -n "${v}" ] || return 1
+	printf '%s' "${v}"
+}
+
+# --- build / --dry-run / --rebuild --------------------------------------------------------------
+
+# 3 つの動作の事前の確認と実行.
+#   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
+#
+# build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
+# rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
+#   版は、指定が無ければ HEAD の版. タグが無ければ止める. 出力先に同名の Zip があれば止める.
+# 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
+#   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" mode="$2"
-	local kind path abs ver vfile vrel tag out zip_file branch tagged_zip
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4"
+	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
 	find_target "${slug}"
 	kind="${T_KIND[${TI}]}"
 	path="${T_PATH[${TI}]}"
-	abs="${CONFIG_DIR}/${path}"
 
 	check_tools
 
 	git -C "${CONFIG_DIR}" rev-parse -q --verify HEAD >/dev/null 2>&1 ||
-		die "このリポジトリにはコミットがまだありません(Zip は HEAD から作ります)."
+		die "このリポジトリにはコミットがまだありません(Zip は HEAD かタグから作ります)."
+	PREFIX="$(git -C "${CONFIG_DIR}" rev-parse --show-prefix)" || die "Git のルートからの位置を取得できません."
+	tp="$(tree_path_of "${path}")"
+	head_sha="$(git -C "${GIT_TOP}" rev-parse HEAD)"
 
-	# 対象のディレクトリと .distignore. dist-archive は .distignore が無いと全ファイルを入れてしまうので、ここで止める.
-	[ -d "${abs}" ] || die "対象のディレクトリ '${path}' がありません."
-	is_tracked "$(rel_join "${path}" .distignore)" ||
-		die "'${path}' に、コミット済みの .distignore がありません.
+	# --- Zip の元になる ref を決める -------------------------------------------------------------
+	if [ "${rebuild}" -eq 1 ]; then
+		# 版: 指定があればそれ. 無ければ HEAD の版.
+		if [ -n "${want_ver}" ]; then
+			ver="${want_ver}"
+		else
+			ver="$(read_version_at "${kind}" "${path}" HEAD)" ||
+				die "HEAD の '${path}' から版を読めません(${kind}: $(version_source "${kind}")). 作り直したい版を '${PROG} ${slug} --rebuild <版>' で指定することもできます."
+		fi
+		valid_version "${ver}" ||
+			die "版 '${ver}' は、タグ名とファイル名に使えない形です(英数字で始まり、英数字・. _ + - だけ)."
+		tag="$(make_tag "${slug}" "${ver}")"
+		git check-ref-format "refs/tags/${tag}" ||
+			die "タグ名 '${tag}' は Git のタグ名として使えません(tag_format を見直してください)."
+		tag_exists "${tag}" ||
+			die "タグ ${tag} がありません. --rebuild は、打ってあるタグから Zip を作り直すためのものです.
+  新しく作るなら、版を確かめて '${PROG} ${slug}' を実行してください(タグも打ちます).
+  HEAD と違う版を作り直すなら、'${PROG} ${slug} --rebuild <版>' で指定してください."
+		ref="$(git -C "${GIT_TOP}" rev-parse "refs/tags/${tag}^{commit}")" || die "タグ ${tag} のコミットを取得できません."
+		refdesc="タグ ${tag}"
+	else
+		ref="${head_sha}"
+		refdesc="HEAD"
+		# 注釈付きタグを打つので、コミッターの名前・メールが要る(Zip を作ってから失敗しないよう、先に確かめる).
+		check_git_identity
+	fi
+
+	# --- 対象のディレクトリと .distignore(ref の時点). dist-archive は .distignore が無いと全ファイルを入れてしまうので止める ---
+	# パスが '.' のとき、blob_exists の '<ref>:<PREFIX>.' は Git が解釈できない. Git のルートからのパス(tp)で指す.
+	git -C "${GIT_TOP}" cat-file -e "${ref}:${tp}" 2>/dev/null ||
+		die "対象のディレクトリ '${path}' が ${refdesc} にありません."
+	blob_exists "${ref}" "$(rel_join "${path}" .distignore)" ||
+		die "'${path}' に、${refdesc} の時点でコミット済みの .distignore がありません.
   wp dist-archive は .distignore が無いと、node_modules・src・設定ファイルを含む全ファイルを Zip に入れます.
-  Zip に入れないものを書いた .distignore を作り、コミットしてください."
+  Zip に入れないものを書いた .distignore を作り、コミットしてください(--rebuild では、タグの時点に無ければ作り直せません)."
 
-	check_clean_tree
+	# --- 作業ツリー(build だけ. rebuild はタグの時点から作るので、作業ツリーを使わない) -----------
+	if [ "${rebuild}" -eq 0 ]; then
+		check_clean_tree
+	fi
 
-	# 版. 読むファイルが Git に入っていること(Zip に入るファイルから版を読むため).
-	vfile="$(version_file "${kind}" "${abs}")" ||
-		die "'${path}' の版を読むファイルがありません(${kind}: $(version_source "${kind}"))."
-	ver="$(read_version "${kind}" "${abs}")" ||
-		die "${vfile#"${CONFIG_DIR}"/} から版を読めません(${kind}: $(version_source "${kind}"))."
-	valid_version "${ver}" ||
-		die "版 '${ver}' は、タグ名とファイル名に使えない形です(英数字で始まり、英数字・. _ + - だけ)."
-	vrel="${vfile#"${CONFIG_DIR}"/}"
-	is_tracked "${vrel}" || die "版を読むファイル '${vrel}' が Git に入っていません(.gitignore に入っていませんか)."
+	# --- 版(ref の時点のファイルから読む) ---------------------------------------------------------
+	vname="$(version_file_at "${kind}" "${path}" "${ref}")" ||
+		die "'${path}' の版を読むファイルが ${refdesc} にありません(${kind}: $(version_source "${kind}"))."
+	vrel="$(rel_join "${path}" "${vname}")"
+	tver="$(read_version_at "${kind}" "${path}" "${ref}")" ||
+		die "${refdesc} の ${vrel} から版を読めません(${kind}: $(version_source "${kind}"))."
+	valid_version "${tver}" ||
+		die "版 '${tver}' は、タグ名とファイル名に使えない形です(英数字で始まり、英数字・. _ + - だけ)."
+	if [ "${rebuild}" -eq 1 ]; then
+		# タグ名の版と、タグの時点のファイルの版が違えば、タグが別の版のコミットを指している.
+		[ "${tver}" = "${ver}" ] ||
+			die "${refdesc} の時点の版は ${tver} で、タグ名の版 ${ver} と食い違っています(タグが別のコミットを指していませんか)."
+	else
+		ver="${tver}"
+	fi
 
-	# check: 版の表記がそろっているか. 食い違いはすべて表示してから止める.
-	check_version_files "${TI}" "${ver}"
+	# --- check: 版の表記がそろっているか. 食い違いはすべて表示してから止める -----------------------
+	check_version_files "${TI}" "${ver}" "${ref}"
 	if [ "${CHECK_BAD}" -gt 0 ]; then
-		err "${PROG}: 版の表記がそろっていません(${vrel} の版 = ${ver} / 食い違い ${CHECK_BAD} 件 / 確認 ${CHECK_TOTAL} 件)."
+		err "${PROG}: 版の表記がそろっていません(${refdesc} の ${vrel} の版 = ${ver} / 食い違い ${CHECK_BAD} 件 / 確認 ${CHECK_TOTAL} 件)."
 		exit "${EXIT_STOP}"
 	fi
 
-	# タグと出力先の Zip. 組み合わせ表の「タグ」「出力先の Zip」の列.
-	tag="$(make_tag "${slug}" "${ver}")"
-	git check-ref-format "refs/tags/${tag}" ||
-		die "タグ名 '${tag}' は Git のタグ名として使えません(tag_format を見直してください)."
+	# --- タグと出力先の Zip. 組み合わせ表の「タグ」「出力先の Zip」の列 -----------------------------
 	out="$(output_dir)"
 	zip_file="${out}/${slug}.${ver}.zip"
-	tagged_zip="no"
-	[ -e "${zip_file}" ] && tagged_zip="yes"
-	if tag_exists "${tag}"; then
-		if [ "${tagged_zip}" = "yes" ]; then
-			die "タグ ${tag} も Zip もすでにあります(${zip_file}). 新しい版を作るなら版を上げてください. 同じ版を作り直すなら、Zip を消してから --rebuild を使ってください."
+	if [ "${rebuild}" -eq 1 ]; then
+		[ ! -e "${zip_file}" ] ||
+			die "Zip がすでにあります(${zip_file}). このツールは上書きしません. 作り直すなら、確かめて消してから実行してください."
+	else
+		tag="$(make_tag "${slug}" "${ver}")"
+		git check-ref-format "refs/tags/${tag}" ||
+			die "タグ名 '${tag}' は Git のタグ名として使えません(tag_format を見直してください)."
+		if tag_exists "${tag}"; then
+			if [ -e "${zip_file}" ]; then
+				die "タグ ${tag} も Zip もすでにあります(${zip_file}). 新しい版を作るなら版を上げてください. 同じ版を作り直すなら、Zip を消してから --rebuild を使ってください."
+			fi
+			die "タグ ${tag} はすでにあります. 新しい版を作るなら版を上げてください. 同じ版の Zip を作り直すなら --rebuild を使ってください."
 		fi
-		die "タグ ${tag} はすでにあります. 新しい版を作るなら版を上げてください. 同じ版の Zip を作り直すなら --rebuild を使ってください."
-	fi
-	if [ "${tagged_zip}" = "yes" ]; then
-		die "タグ ${tag} は無いのに、Zip がすでにあります(${zip_file}). 前回の作りかけか、別の作業の Zip です. 確かめて消してから実行してください."
+		if [ -e "${zip_file}" ]; then
+			die "タグ ${tag} は無いのに、Zip がすでにあります(${zip_file}). 前回の作りかけか、別の作業の Zip です. 確かめて消してから実行してください."
+		fi
 	fi
 
 	# 出力先が Git の中で、無視もされていなければ、作った Zip が次回の作業ツリーを汚す(警告だけ).
@@ -788,15 +967,24 @@ cmd_build() {
 			;;
 	esac
 
+	# ブランチ(build だけ. タグを打つコミットがどこかを確かめやすいよう表示する)
 	branch="$(git -C "${CONFIG_DIR}" branch --show-current)"
-	case "${branch}" in
-		main | master) ;;
-		'') err "警告: HEAD がブランチにありません(detached HEAD). 意図したコミットか確かめてください." ; branch="(detached HEAD)" ;;
-		*) err "警告: ブランチは ${branch} です(main / master ではありません). リリースのタグを打つコミットか確かめてください." ;;
-	esac
+	if [ "${rebuild}" -eq 0 ]; then
+		case "${branch}" in
+			main | master) ;;
+			'')
+				err "警告: HEAD がブランチにありません(detached HEAD). 意図したコミットか確かめてください."
+				branch="(detached HEAD)"
+				;;
+			*) err "警告: ブランチは ${branch} です(main / master ではありません). リリースのタグを打つコミットか確かめてください." ;;
+		esac
+	fi
+	short="$(git -C "${GIT_TOP}" rev-parse --short "${ref}")"
 
-	if [ "${mode}" = "dry-run" ]; then
+	# --- --dry-run: 要約だけ出して終わる ---------------------------------------------------------
+	if [ "${dry}" -eq 1 ]; then
 		printf '[dry-run] Zip もタグも作りません. 事前の確認はすべて通りました.\n\n'
+		printf '動作:       %s\n' "$([ "${rebuild}" -eq 1 ] && echo "--rebuild(${refdesc} から Zip だけを作り直す)" || echo "build(HEAD から Zip を作り、タグを打つ)")"
 		printf '対象:       %s (%s)\n' "${slug}" "${kind}"
 		printf 'パス:       %s\n' "${path}"
 		printf '版:         %s (%s)\n' "${ver}" "${vrel}"
@@ -805,19 +993,63 @@ cmd_build() {
 		else
 			printf 'check:      %s 件とも一致\n' "${CHECK_TOTAL}"
 		fi
-		printf 'ブランチ:   %s\n' "${branch}"
-		printf 'タグ:       %s (まだありません)\n' "${tag}"
+		if [ "${rebuild}" -eq 1 ]; then
+			printf 'タグ:       %s (あります・コミット %s)\n' "${tag}" "${short}"
+		else
+			printf 'ブランチ:   %s\n' "${branch}"
+			printf 'タグ:       %s (まだありません・打つコミット %s)\n' "${tag}" "${short}"
+		fi
 		printf 'Zip:        %s\n' "${zip_file}"
-		printf '\n実行すると、HEAD の内容から Zip を作ります.\n'
 		return 0
 	fi
 
-	# Zip を作る(HEAD の時点の内容から). タグ付けはまだ実装していない(Step 5).
-	printf '%s (%s) を作ります: 版 %s・HEAD %s\n' "${slug}" "${kind}" "${ver}" "$(git -C "${CONFIG_DIR}" rev-parse --short HEAD)"
-	make_zip "${slug}" "${path}" HEAD "${zip_file}"
+	# --- 実行 ----------------------------------------------------------------------------------
+	if [ "${rebuild}" -eq 1 ]; then
+		printf '%s (%s) を作り直します: 版 %s・%s(コミット %s)\n' "${slug}" "${kind}" "${ver}" "${refdesc}" "${short}"
+		make_zip "${slug}" "${path}" "${ref}" "${zip_file}"
+		printf '\n'
+		print_zip_summary "${slug}" "${zip_file}"
+		report_rebuild_sha "${tag}" "${zip_file}"
+		return 0
+	fi
+
+	printf '%s (%s) を作ります: 版 %s・HEAD %s\n' "${slug}" "${kind}" "${ver}" "${short}"
+	make_zip "${slug}" "${path}" "${ref}" "${zip_file}"
+	# タグを打てなければ、Zip も消す(「タグの無い Zip」を残すと、次回の実行が止まるため).
+	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}"; then
+		rm -f -- "${zip_file}"
+		die "タグ ${tag} を打てませんでした(Zip は消しました). Git のエラーを確かめてから、もう一度実行してください."
+	fi
 	printf '\n'
 	print_zip_summary "${slug}" "${zip_file}"
-	printf '\n注意: タグ %s はまだ打っていません(開発中: タグ付けは Step 5 で実装します). 作り直すなら Zip を消してから実行してください.\n' "${tag}"
+	printf '\nタグ:       %s を打ちました(注釈付き・コミット %s).\n' "${tag}" "${short}"
+	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
+}
+
+# --rebuild で作り直した Zip を、タグに記録された値と比べて表示する(一致しなくても止めない).
+# 比べるのは「内容の指紋」. Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため)ので、
+# 一致しなくてよい. 配布済みの Zip と同じか確かめたいときは、その Zip の SHA-256 を、タグに記録された SHA-256 と比べる.
+#   $1 = タグ名 / $2 = 作り直した Zip のパス
+report_rebuild_sha() {
+	local tag="$1" zip_file="$2" now recorded
+	recorded="$(tag_recorded_field "${tag}" "Content-SHA-256")"
+	now="$(zip_content_digest "${zip_file}")" || now=""
+	printf '\nタグとの比較:\n'
+	if [ -z "${now}" ]; then
+		printf '  Zip の内容の指紋を計算できませんでした(unzip が無い?). 中身(上の内訳)を目で確かめてください.\n'
+	elif [ -z "${recorded}" ]; then
+		printf '  タグ %s に、内容の指紋(Content-SHA-256)の記録がありません(古いタグ、または別の方法で打ったタグ). 中身(上の内訳)を目で確かめてください.\n' "${tag}"
+	elif [ "${recorded}" = "${now}" ]; then
+		printf '  内容の指紋が、タグの記録と一致しました(元の Zip と同じファイル・同じ内容です).\n'
+	else
+		printf '  内容の指紋が、タグの記録と違います.\n    タグの記録: %s\n    今回:       %s\n' "${recorded}" "${now}"
+		printf '  .distignore・zip・wp dist-archive の版や、タグの後の環境の違いで、入るファイルが変わった可能性があります. 中身(上の内訳)を確かめてください.\n'
+	fi
+	# 配布した Zip の現物との照合用に、タグに記録された SHA-256 を添える(記録がなければ何も言わない).
+	recorded="$(tag_recorded_field "${tag}" "SHA-256")"
+	if [ -n "${recorded}" ]; then
+		printf '  (Zip 全体の SHA-256 は、作り直すたびに変わります. 配布した Zip の現物は、タグに記録された SHA-256 と照合してください: %s)\n' "${recorded}"
+	fi
 }
 
 # --- 入口 ---------------------------------------------------------------------------------------
@@ -844,39 +1076,37 @@ main() {
 		esac
 	done
 
-	# 残りの引数を解釈する.
-	local slug="" mode="build"
+	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
+	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
+	local slug="" version="" want_list=0 dry=0 rebuild=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
-			--list)
-				mode="list"
-				;;
-			--dry-run)
-				mode="dry-run"
-				;;
-			--rebuild)
-				mode="rebuild"
-				;;
+			--list) want_list=1 ;;
+			--dry-run) dry=1 ;;
+			--rebuild) rebuild=1 ;;
 			-*)
 				err "${PROG}: 不明なオプション '$1'"
 				err "'${PROG} --help' で使い方を確認してください."
 				exit "${EXIT_USAGE}"
 				;;
 			*)
-				if [ -n "${slug}" ]; then
-					err "${PROG}: スラッグは 1 つだけ指定してください('${slug}' と '$1')."
+				if [ -z "${slug}" ]; then
+					slug="$1"
+				elif [ -z "${version}" ]; then
+					version="$1"
+				else
+					err "${PROG}: 余分な引数です('$1'). スラッグ(と --rebuild のときの版)だけを指定してください."
 					exit "${EXIT_USAGE}"
 				fi
-				slug="$1"
 				;;
 		esac
 		shift
 	done
 
-	# --list はスラッグを取らない. それ以外はスラッグが要る.
-	if [ "${mode}" = "list" ]; then
-		if [ -n "${slug}" ]; then
-			err "${PROG}: --list にはスラッグを付けられません('${slug}')."
+	# --list は、スラッグも他のオプションも取らない.
+	if [ "${want_list}" -eq 1 ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ]; then
+			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
 		cmd_list
@@ -887,11 +1117,13 @@ main() {
 		err "'${PROG} --help' で使い方を確認してください."
 		exit "${EXIT_USAGE}"
 	fi
+	# 版の指定は、作り直す版を決めるためのもの. 通常の実行では HEAD の版を使うので、受け付けない(打ち間違いを防ぐ).
+	if [ -n "${version}" ] && [ "${rebuild}" -eq 0 ]; then
+		err "${PROG}: 版を指定できるのは --rebuild のときだけです('${version}'). 通常の実行は、HEAD の版でタグを打ちます."
+		exit "${EXIT_USAGE}"
+	fi
 
-	case "${mode}" in
-		build | dry-run) cmd_build "${slug}" "${mode}" ;;
-		rebuild) not_implemented "--rebuild(Step 5 で実装します)" ;;
-	esac
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}"
 }
 
 main "$@"
