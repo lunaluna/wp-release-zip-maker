@@ -213,6 +213,48 @@ test_missing_dist_archive_stops_with_install_instructions() {
 	assert_has "wp package install wp-cli/dist-archive-command:3.1.0"
 }
 
+# PATH から unzip だけを外したディレクトリを作り、その場所を標準出力へ出す.
+# 今の PATH にあるコマンドへのリンクを、unzip 以外すべて置く(同名は PATH の先にあるものを優先).
+make_path_without_unzip() {
+	local d="${TEST_ROOT}/path-without-unzip" dir f
+	mkdir -p "${d}"
+	local IFS=:
+	for dir in ${PATH}; do
+		[ -d "${dir}" ] || continue
+		for f in "${dir}"/*; do
+			[ -x "${f}" ] && [ ! -d "${f}" ] || continue
+			[ "$(basename "${f}")" = unzip ] && continue
+			[ -e "${d}/$(basename "${f}")" ] || ln -s "${f}" "${d}/$(basename "${f}")"
+		done
+	done
+	printf '%s' "${d}"
+}
+
+# unzip が無ければ、build・--rebuild・それぞれの --dry-run は止まり、何も作らない. --list は動く(Zip を扱わない).
+test_missing_unzip_stops_build_and_rebuild_but_not_list() {
+	pf_setup tool3
+	local nounzip
+	nounzip="$(make_path_without_unzip)"
+	[ ! -e "${nounzip}/unzip" ] || { fail "テストの準備: PATH から unzip を外せていない"; return; }
+	git tag -a my-plugin/1.2.3 -m "my-plugin 1.2.3" >/dev/null   # --rebuild のために、タグを 1 つ作っておく
+	local args
+	for args in "my-plugin" "my-plugin --dry-run" "my-plugin --rebuild" "my-plugin --rebuild --dry-run"; do
+		LABEL="unzip なし: ${args}"
+		# shellcheck disable=SC2086  # args は空白で分けて渡す
+		run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${FAKE_WP}" "PATH=${nounzip}" -- ${args}
+		assert_rc 1
+		assert_has "unzip コマンドが見つかりません"
+		assert_has "apt install unzip"
+		assert_no_file "${OUTD}"
+	done
+	assert_eq "my-plugin/1.2.3" "$(git tag)" "unzip なしの実行が増やしたタグ"
+	LABEL="unzip なし: --list"
+	run_tool_env "PATH=${nounzip}" -- --list
+	assert_rc 0
+	assert_has "my-plugin"
+	assert_lacks "unzip"
+}
+
 # --- 警告(止めない) -----------------------------------------------------------------------------
 
 test_output_inside_the_repository_warns_unless_ignored() {

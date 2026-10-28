@@ -24,6 +24,23 @@ test_help_lists_all_commands() {
 	assert_has "--version"
 }
 
+# --verify-content は --dry-run と一緒にだけ使える(単独・--list・--rebuild だけ は使い方の誤り). 説明にも載る.
+test_verify_content_needs_dry_run() {
+	run_tool --help; assert_has "--verify-content"
+	LABEL="単独"; run_tool my-plugin --verify-content; assert_rc 2; assert_has "--verify-content は --dry-run と一緒にだけ"
+	LABEL="--rebuild だけ"; run_tool my-plugin --rebuild --verify-content; assert_rc 2; assert_has "--verify-content は --dry-run と一緒にだけ"
+	LABEL="--list"; run_tool --list --verify-content; assert_rc 2; assert_has "--list には"
+}
+
+# --json は、パスを 1 つ取り、build・--rebuild の成功のあとにだけ使える(--dry-run・--list とは使えない).
+test_json_option_usage_errors() {
+	run_tool --help; assert_has "--json <パス>"
+	LABEL="パスなし"; run_tool my-plugin --json; assert_rc 2; assert_has "--json にはレポートを作るパスを付けてください"
+	LABEL="次がオプション"; run_tool my-plugin --json --manifest; assert_rc 2; assert_has "--json にはレポートを作るパスを付けてください"
+	LABEL="--dry-run"; run_tool my-plugin --dry-run --json r.json; assert_rc 2; assert_has "--json は --dry-run と一緒に使えません"
+	LABEL="--list"; run_tool --list --json r.json; assert_rc 2; assert_has "--list には"
+}
+
 test_help_wins_over_other_arguments() {
 	run_tool --foo --help
 	assert_rc 0

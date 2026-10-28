@@ -13,7 +13,7 @@
 set -u
 
 # ツール自身の版. リリースのタグ(素の版番号)・CHANGELOG・README と必ずそろえる.
-WP_RELEASE_ZIP_MAKER_VERSION="1.1.0"
+WP_RELEASE_ZIP_MAKER_VERSION="1.2.0"
 
 # 自分の名前(--help などの表示用). シンボリックリンク経由で呼ばれても同じ名前を出す.
 PROG="wp-release-zip-maker"
@@ -42,6 +42,10 @@ GIT_TOP=""      # Git のルート(シンボリックリンクを解いた絶対
 CFG_TAG_FORMAT=""
 CFG_OUTPUT=""
 CFG_REQUIRES=""
+# 大きさの上限(省略可. 空 = 確かめない). 値はバイト数・ファイル数の整数(K・M・G は読み込み時に掛けて整数にする).
+CFG_MAX_ZIP_BYTES=""          # Zip のファイルの大きさ
+CFG_MAX_FILES=""              # Zip の中のファイルの数(ディレクトリは数えない)
+CFG_MAX_UNCOMPRESSED_BYTES="" # 展開したときの合計の大きさ
 
 # --- 表示まわり ---------------------------------------------------------------------------------
 
@@ -71,6 +75,12 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
       署名付きのタグ(git tag -s)を打つ. gpg と鍵が要る. 署名できなければ、タグも Zip も作らない
   ${PROG} <slug> --dry-run
       確認だけ(Zip もタグも作らない)
+  ${PROG} <slug> [--rebuild [<版>]] --dry-run --verify-content
+      確認のあと、一時ディレクトリに Zip を作り、本番と同じ中身の確認(検査・大きさの上限・名前の警告)をして、
+      サマリーを出して Zip を消す. 出力先・タグ・マニフェストには何も作らない. --dry-run のときだけ指定できる
+  ${PROG} <slug> [--rebuild [<版>]] --json <パス>
+      成功したあと、機械が読める JSON のレポート(版・タグ・コミット・Zip の大きさと SHA-256・内容の指紋など)を、
+      <パス>(カレントからの相対でもよい)に作る. 上書きしない. --dry-run・--list とは使えない
   ${PROG} <slug> [--rebuild [<版>]] --manifest
       Zip のファイルごとの SHA-256 の一覧(<slug>.<版>.manifest.txt)も、出力先に作る
   ${PROG} <slug> --rebuild [<版>]
@@ -215,7 +225,7 @@ load_config() {
 	find_config
 
 	local line lineno=0 first rest value kind path slug extra
-	local seen_tag_format=0 seen_output=0 seen_requires=0
+	local seen_tag_format=0 seen_output=0 seen_requires=0 seen_limits=' '
 
 	while IFS= read -r line || [ -n "${line}" ]; do
 		lineno=$((lineno + 1))
@@ -232,7 +242,7 @@ load_config() {
 		rest="$(trim "${line#"${first}"}")"
 
 		case "${first}" in
-			tag_format | output | requires)
+			tag_format | output | requires | max_zip_bytes | max_files | max_uncompressed_bytes)
 				case "${rest}" in
 					=*) value="$(trim "${rest#=}")" ;;
 					*) die "${CONFIG_NAME}:${lineno}: '${first} = 値' の形で書いてください." ;;
@@ -253,6 +263,20 @@ load_config() {
 						[ "${seen_requires}" -eq 0 ] || die "${CONFIG_NAME}:${lineno}: requires が 2 回書かれています."
 						seen_requires=1
 						CFG_REQUIRES="${value}"
+						;;
+					max_zip_bytes | max_files | max_uncompressed_bytes)
+						case "${seen_limits}" in
+							*" ${first} "*) die "${CONFIG_NAME}:${lineno}: ${first} が 2 回書かれています." ;;
+						esac
+						seen_limits="${seen_limits}${first} "
+						# 大きさの上限は 1 つの設定ファイルに 1 つ(対象ごとには持たない). 値は正の整数で、末尾に K・M・G を付けてもよい.
+						value="$(parse_limit "${value}")" ||
+							die "${CONFIG_NAME}:${lineno}: ${first} は、正の整数で書いてください(末尾に K・M・G を付けてもよい. 例: 20M). '$(trim "${rest#=}")' は読めません."
+						case "${first}" in
+							max_zip_bytes) CFG_MAX_ZIP_BYTES="${value}" ;;
+							max_files) CFG_MAX_FILES="${value}" ;;
+							max_uncompressed_bytes) CFG_MAX_UNCOMPRESSED_BYTES="${value}" ;;
+						esac
 						;;
 				esac
 				;;
@@ -298,6 +322,26 @@ load_config() {
 	done <"${CONFIG_FILE}"
 
 	validate_config
+}
+
+# 上限の値("20M"・"500"・"1G" など)を整数にして標準出力へ出す. 書けるのは正の整数と、末尾の K・M・G(1024 の倍数. 小文字も可).
+# 読めなければ何も出さず 1 を返す. 桁は 12 桁まで(bash の整数の範囲に収まり、G を掛けても溢れない).
+parse_limit() {
+	local v="$1" num mult=1
+	case "${v}" in
+		*[Kk]) mult=1024; num="${v%?}" ;;
+		*[Mm]) mult=1048576; num="${v%?}" ;;
+		*[Gg]) mult=1073741824; num="${v%?}" ;;
+		*) num="${v}" ;;
+	esac
+	case "${num}" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "${#num}" -le 12 ] || return 1
+	# 先頭の 0 を 8 進数と読ませない(10# を付ける).
+	num=$((10#${num}))
+	[ "${num}" -gt 0 ] || return 1
+	printf '%s' "$((num * mult))"
 }
 
 # 読み込んだ設定の全体としての整合を確かめる(行ごとの形式は load_config で確かめ済み).
@@ -551,10 +595,14 @@ find_target() {
 	die "スラッグ '${slug}' は ${CONFIG_NAME} にありません. 設定にあるスラッグ:${known}"
 }
 
-# Zip の作成に要る道具(zip コマンド・WP-CLI・wp dist-archive)があるかを確かめる. 無ければ入れ方を示して止める.
+# Zip の作成に要る道具(zip・unzip コマンド・WP-CLI・wp dist-archive)があるかを確かめる. 無ければ入れ方を示して止める.
+# unzip は必須: Zip の中身の検査(スラッグのフォルダー・配布してはいけないファイル・外へ出る名前)と内容の指紋に使う.
+# 1.1.0 までは、無ければ警告して検査を省き、タグまで作った. 検査を省いたまま配布物ができるのを避けるため、止める(2026-10-28 のレビュー).
 check_tools() {
 	command -v zip >/dev/null 2>&1 ||
 		die "zip コマンドが見つかりません. wp dist-archive が Zip を作るときに使います(macOS は標準. Linux は zip パッケージを入れてください)."
+	command -v unzip >/dev/null 2>&1 ||
+		die "unzip コマンドが見つかりません. 作った Zip の中身の検査(スラッグのフォルダー・配布してはいけないファイル・外へ出る名前)と、内容の指紋に使います(macOS は標準. Debian 系は apt install unzip)."
 	command -v "${WP_BIN}" >/dev/null 2>&1 ||
 		die "WP-CLI(${WP_BIN})が見つかりません. 入れ方: https://wp-cli.org/ (macOS の Homebrew: brew install wp-cli)"
 	# 登録されたコマンドなら --help は 0 で終わり、未登録なら 1 で終わる(WP-CLI 2.12.0 で確認).
@@ -640,6 +688,13 @@ check_version_files() {
 
 # 一時ディレクトリ(make_zip が作る). 終了時に必ず消す.
 TMP_WORK=""
+# make_zip が、作った Zip を 1 回だけ展開して走査した結果(zip_scan の行)を書くファイル. TMP_WORK の中にある.
+# 内容の指紋(タグ・--rebuild の比較)とマニフェストは、このファイルを読む(同じ走査の結果なので食い違わず、展開も 1 回で済む).
+ZIP_SCAN_FILE=""
+# make_zip が作った Zip の、一時ディレクトリの中のパス(置く前の Zip. --verify-content は、これを表示して消す).
+BUILT_ZIP=""
+# check_rebuild_digest の結果(--json の content_match 用): 1 = 一致 / 0 = 不一致 / 空 = 記録なし・比べられない.
+REBUILD_CONTENT_MATCH=""
 # 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
 PART_FILE=""
 
@@ -683,6 +738,7 @@ sha256_files_stdin() {
 }
 
 # Zip の中身を一時ディレクトリへ展開し、内容を表す行を並べ替えて標準出力へ出す(内容の指紋とマニフェストの元になるデータ). 展開できない・ファイルが 1 つも無ければ、何も出さず 1 を返す.
+# unzip の有無は check_tools が確かめ済み(無ければ、ここへ来る前に止まる).
 #   F <内容の SHA-256> ./<パス>   通常のファイル(内容そのものを SHA-256 にする)
 #   X ./<パス>                    実行権限(所有者)があるファイル
 #   L ./<パス> -> <リンク先>      シンボリックリンク
@@ -690,7 +746,6 @@ sha256_files_stdin() {
 # 展開先は TMP_WORK の下に作る(make_zip が作り、終了時に cleanup_tmp が消す. 途中で中断されても取り残さない). パスの ASCII 以外のバイトは、そのまま扱う(LC_ALL=C).
 zip_scan() {
 	local dir lines
-	command -v unzip >/dev/null 2>&1 || return 1
 	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || return 1
 	dir="$(mktemp -d "${TMP_WORK}/digest.XXXXXX")" || return 1
 	if ! unzip -qq "$1" -d "${dir}" </dev/null >/dev/null 2>&1; then
@@ -711,33 +766,31 @@ zip_scan() {
 	printf '%s\n' "${lines}"
 }
 
-# Zip の「内容の指紋」を標準出力へ出す. unzip が無い・展開できない・ファイルが無ければ、何も出さず 1 を返す.
+# Zip の「内容の指紋」を標準出力へ出す. make_zip が作った走査の結果(ZIP_SCAN_FILE)が無ければ、何も出さず 1 を返す.
 # zip_scan の行(ファイルの内容・実行権限・リンク先を含み、時刻・属性・圧縮のしかたを含まない)を SHA-256 にしたもの.
 # 以前は unzip -v の CRC-32 と名前から作っていた. CRC-32 は、同じ値になる別の内容を意図的に作れるので、同じ内容かどうかの根拠にならない(2026-10-26 のレビュー).
 # Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため. 2026-10-26 に確認). 内容が同じかどうかは、この指紋で比べる.
 zip_content_digest() {
-	local scan
-	scan="$(zip_scan "$1")" || return 1
-	printf '%s\n' "${scan}" | sha256_stdin
+	[ -n "${ZIP_SCAN_FILE}" ] && [ -s "${ZIP_SCAN_FILE}" ] || return 1
+	sha256_stdin <"${ZIP_SCAN_FILE}"
 }
 
-# Zip のマニフェスト(ファイルごとの "<SHA-256>  <Zip の一番上のフォルダーからのパス>")を標準出力へ出す. zip_scan が出せなければ、何も出さず 1 を返す.
-# 内容の指紋と同じデータ(zip_scan の F の行)から作るので、両者は食い違わない. 形は shasum -a 256 -c が読める('  ' の 2 つの空白).
+# Zip のマニフェスト(ファイルごとの "<SHA-256>  <Zip の一番上のフォルダーからのパス>")を標準出力へ出す. 走査の結果(ZIP_SCAN_FILE)が無ければ、何も出さず 1 を返す.
+# 内容の指紋と同じファイル(ZIP_SCAN_FILE の F の行)から作るので、両者は食い違わない. 形は shasum -a 256 -c が読める('  ' の 2 つの空白).
 # 展開した Zip のディレクトリで `shasum -a 256 -c <マニフェスト>` を実行すれば、中身が同じかを照合できる.
 # 実行権限とシンボリックリンクは載せない(内容の指紋には入っている).
 zip_manifest() {
-	local scan
-	scan="$(zip_scan "$1")" || return 1
-	printf '%s\n' "${scan}" | LC_ALL=C sed -n 's/^F \([0-9a-f]\{64\}\) \.\//\1  /p'
+	[ -n "${ZIP_SCAN_FILE}" ] && [ -s "${ZIP_SCAN_FILE}" ] || return 1
+	LC_ALL=C sed -n 's/^F \([0-9a-f]\{64\}\) \.\//\1  /p' "${ZIP_SCAN_FILE}"
 }
 
-# Zip のマニフェストを作って、出力先へ上書きせずに置き、場所とファイル数を表示する. 作れなければ(unzip が無い・展開できない)非 0 を返す.
+# Zip のマニフェストを作って、出力先へ上書きせずに置き、場所とファイル数を表示する. 作れなければ(展開できない)非 0 を返す.
 #   $1 = Zip のパス / $2 = マニフェストの最終のパス
 write_manifest() {
 	local zip_file="$1" dest="$2" tmp n
 	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || return 1
 	tmp="${TMP_WORK}/manifest.txt"
-	zip_manifest "${zip_file}" >"${tmp}" || return 1
+	zip_manifest >"${tmp}" || return 1
 	[ -s "${tmp}" ] || return 1
 	n="$(wc -l <"${tmp}")"
 	n=$((n))
@@ -756,11 +809,13 @@ human_size() {
 
 # Git の ref($3)の時点の対象ディレクトリから Zip を作る. 作業ツリーは使わない(未追跡・無視されたファイルは入らない).
 #   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(コミットのハッシュ) / $4 = 出力する Zip のパス / $5 = 種類(plugin・theme・dir)
+#   $6 = 1(既定)なら、確認のあと出力先へ置く(publish_zip). 0 なら置かない(--dry-run --verify-content). 置かないときも、確認はすべて同じに行う.
+# 作った Zip(確認のあと・置く前)は BUILT_ZIP に入る. 置かなければ、その Zip は TMP_WORK の中にだけあり、終了時に消える.
 # 手順: git archive で一時ディレクトリ/<スラッグ>/ へ展開 → wp dist-archive(.distignore を適用して zip) → 中身の確認.
 # 一時ディレクトリの名前を実パスにするのは、シンボリックリンクを含むと dist-archive が別の経路(コピー)に入るため.
 # 一時ディレクトリの下をスラッグと同じ名前にするのは、Zip の一番上のフォルダー名をスラッグにするため.
 make_zip() {
-	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5"
+	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5" place="${6:-1}"
 	local tree_path dest st wp_out wp_rc built
 
 	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う). PREFIX は cmd_build が埋める.
@@ -801,39 +856,64 @@ ${wp_out}"
 
 	verify_zip "${slug}" "${built}" "${kind}"
 	warn_non_ascii_names "${dest}"
-	publish_zip "${built}" "${zip_file}"
+	# 大きさの上限(書いてあれば). 超えていれば、ここで止まる(出力先には何も置かない).
+	check_zip_limits "${slug}" "${built}"
+	# 中身の走査(展開とハッシュ)は、ここで 1 回だけ行う. 以降の指紋・マニフェストはこの結果を読む.
+	# 置く前(publish_zip の前)に行うので、展開できなければ、最終のパスに Zip を残さずに止まる.
+	ZIP_SCAN_FILE="${TMP_WORK}/scan.txt"
+	zip_scan "${built}" >"${ZIP_SCAN_FILE}" || die "Zip を展開できず、中身を走査できませんでした(内容の指紋を作れないので、Zip は作りません)."
+	BUILT_ZIP="${built}"
+	[ "${place}" -eq 0 ] || publish_zip "${built}" "${zip_file}"
 }
 
 # 作ったファイル($1)を、最終のパス($2)へ、上書きせずに置く. すでに何かあれば(壊れたシンボリックリンクも)、置かずに止める.
 # $3 = 表示に使う呼び名(省略すると Zip. マニフェストも同じ手順で置くため).
+# $4 = 1 なら、置けなくても止めずに、メッセージを出して 1 を返す(--json のレポート用. 置けなくても、Zip とタグはできているため).
+#   省略(0)なら、置けないときは die で止める(Zip・マニフェスト).
 # 手順: 出力先と同じディスク上の一時ファイルへコピー → ln(ハードリンク)で最終のパスの名前を作る → 一時ファイルを消す.
 #   ln は、行き先がすでにあれば必ず失敗する(確認と作成が 1 つの操作になる). 一時ファイルは出力先と同じディスクに作るので、ln が使える.
 #   ハードリンクを作れないファイルシステムでは、mv -n で置く(あとで一時ファイルが残っていれば、すでにあったと判断する).
 # 一時ファイルは mktemp の 0600 のままにせず、umask どおりの権限にする(以前の dist-archive の出力と同じ).
 publish_zip() {
-	local src="$1" dest="$2" label="${3:-Zip}" dir mode
+	local src="$1" dest="$2" label="${3:-Zip}" soft="${4:-0}" dir mode
 	dir="$(dirname "${dest}")"
-	mkdir -p -- "${dir}" || die "出力先 ${dir} を作れません."
-	PART_FILE="$(mktemp "${dir}/.$(basename "${dest}").XXXXXX")" || die "出力先 ${dir} に一時ファイルを作れません(書き込めますか?)."
+	if ! mkdir -p -- "${dir}"; then
+		publish_fail "${soft}" "出力先 ${dir} を作れません." || return 1
+	fi
+	if ! PART_FILE="$(mktemp "${dir}/.$(basename "${dest}").XXXXXX")"; then
+		PART_FILE=""
+		publish_fail "${soft}" "出力先 ${dir} に一時ファイルを作れません(書き込めますか?)." || return 1
+	fi
 	mode="$(printf '%o' $((0666 & ~$(umask))))"
 	if ! { cp -- "${src}" "${PART_FILE}" && chmod "${mode}" "${PART_FILE}"; }; then
-		die "${label} を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)."
+		publish_fail "${soft}" "${label} を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)." || return 1
 	fi
 	if [ -e "${dest}" ] || [ -L "${dest}" ]; then
-		die "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+		publish_fail "${soft}" "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください." || return 1
 	fi
 	if ! ln -- "${PART_FILE}" "${dest}" 2>/dev/null; then
 		if [ -e "${dest}" ] || [ -L "${dest}" ]; then
-			die "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+			publish_fail "${soft}" "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください." || return 1
 		fi
 		# ハードリンクを作れない(ln が使えないファイルシステム). mv -n は、行き先があれば動かない.
 		mv -n -- "${PART_FILE}" "${dest}" 2>/dev/null
 		if [ -e "${PART_FILE}" ]; then
-			die "${label} を ${dest} へ置けませんでした(すでにあるか、書き込めません)."
+			publish_fail "${soft}" "${label} を ${dest} へ置けませんでした(すでにあるか、書き込めません)." || return 1
 		fi
 	fi
 	rm -f -- "${PART_FILE}"
 	PART_FILE=""
+}
+
+# publish_zip の失敗の扱い. $1 = 1 なら、メッセージを出して作りかけの一時ファイルを消し、1 を返す(呼び出し側が続ける). 0 なら die で止める(一時ファイルは終了時に消える).
+publish_fail() {
+	local soft="$1"
+	shift
+	[ "${soft}" -eq 1 ] || die "$*"
+	err "${PROG}: $*"
+	[ -z "${PART_FILE}" ] || rm -f -- "${PART_FILE}"
+	PART_FILE=""
+	return 1
 }
 
 # Zip に入るファイル名に ASCII 以外(日本語など)があれば警告する(止めはしない).
@@ -851,14 +931,10 @@ warn_non_ascii_names() {
 	fi
 }
 
-# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること・配布してはいけないファイルが無いこと. unzip が無ければ確認を省く.
+# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること・配布してはいけないファイルが無いこと.
 #   $1 = スラッグ / $2 = Zip のパス / $3 = 種類(plugin・theme・dir)
 verify_zip() {
 	local slug="$1" zip_file="$2" kind="$3" found stops warns n escapes
-	if ! command -v unzip >/dev/null 2>&1; then
-		err "警告: unzip が無いので、Zip の中身の確認(スラッグのフォルダー・配布してはいけないファイルの検査)を省きました. 中身を自分で確かめてから使ってください."
-		return 0
-	fi
 	# スラッグに正規表現の記号(ドット)があっても安全なよう、awk の index() で前方一致を見る.
 	# LC_ALL=C: ファイル名に ASCII 以外が入ると、ロケールによっては awk・sort が不正なバイト列で落ちるため.
 	if ! unzip -Z1 "${zip_file}" | LC_ALL=C awk -v s="${slug}/" 'index($0, s) != 1 { bad = 1 } END { exit bad ? 1 : 0 }'; then
@@ -945,7 +1021,71 @@ scan_zip_names() {
 		}'
 }
 
-# 作った Zip の要約を出す(ファイル数・サイズ・SHA-256・一番上のフォルダーの直下の内訳).
+# 大きさの上限を書いているときだけ、「上限: 〜 以下」の行を出す(確かめたあとの要約に付く. 超えていれば、ここへ来る前に止まっている).
+print_limits_line() {
+	local parts=""
+	[ -z "${CFG_MAX_ZIP_BYTES}" ] || parts="${parts:+${parts}・}Zip ${CFG_MAX_ZIP_BYTES} バイト"
+	[ -z "${CFG_MAX_FILES}" ] || parts="${parts:+${parts}・}ファイル ${CFG_MAX_FILES} 個"
+	[ -z "${CFG_MAX_UNCOMPRESSED_BYTES}" ] || parts="${parts:+${parts}・}展開後 ${CFG_MAX_UNCOMPRESSED_BYTES} バイト"
+	[ -z "${parts}" ] || printf '上限:       %s 以下(%s の設定)\n' "${parts}" "${CONFIG_NAME}"
+}
+
+# Zip の中の、通常のファイルの数(ディレクトリのエントリは数えない). $1 = Zip のパス
+zip_file_count() {
+	unzip -Z1 "$1" | LC_ALL=C awk '$0 !~ /\/$/ { n++ } END { print n + 0 }'
+}
+
+# Zip を展開したときの合計のバイト数. unzip -Zt の "N bytes uncompressed" から読む. 読めなければ unzip -l の合計の行で読む. どちらも読めなければ 1 を返す.
+# 書式は Info-ZIP の版で違う可能性がある(この Mac の unzip 6.00 で確かめた. 他の版は未確認).
+zip_uncompressed_bytes() {
+	local n
+	n="$(unzip -Zt "$1" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) bytes uncompressed.*/\1/p' | head -n 1)"
+	if [ -z "${n}" ]; then
+		n="$(unzip -l "$1" | tail -n 1 | awk '{ print $1 }')"
+	fi
+	case "${n}" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+	printf '%s' "${n}"
+}
+
+# 大きさの上限を確かめる. 書いてある項目だけ確かめる(どれも書いていなければ何もしない).
+# 超えたら、超えた項目と値・大きいファイルの上位 10 個(展開後の大きさ順)・直下の内訳を出して、終了コード 1 で止める.
+# 呼ぶのは make_zip の中(最終のパスへ置く前)なので、止まっても出力先に Zip は残らない(一時ディレクトリの Zip は、終了時に消える).
+#   $1 = スラッグ / $2 = 確かめる Zip のパス
+check_zip_limits() {
+	local slug="$1" zip_file="$2" bytes files unc over=""
+	[ -n "${CFG_MAX_ZIP_BYTES}${CFG_MAX_FILES}${CFG_MAX_UNCOMPRESSED_BYTES}" ] || return 0
+	bytes="$(wc -c <"${zip_file}")"
+	bytes=$((bytes))
+	files="$(zip_file_count "${zip_file}")"
+	if [ -n "${CFG_MAX_UNCOMPRESSED_BYTES}" ]; then
+		unc="$(zip_uncompressed_bytes "${zip_file}")" ||
+			die "Zip の展開後の大きさを読めませんでした(max_uncompressed_bytes を確かめられないので、止めます)."
+	fi
+	if [ -n "${CFG_MAX_ZIP_BYTES}" ] && [ "${bytes}" -gt "${CFG_MAX_ZIP_BYTES}" ]; then
+		over="${over}  max_zip_bytes: Zip の大きさ $(human_size "${bytes}")(${bytes} バイト)が、上限 $(human_size "${CFG_MAX_ZIP_BYTES}")(${CFG_MAX_ZIP_BYTES} バイト)を超えています"$'\n'
+	fi
+	if [ -n "${CFG_MAX_FILES}" ] && [ "${files}" -gt "${CFG_MAX_FILES}" ]; then
+		over="${over}  max_files: ファイルの数 ${files} 個が、上限 ${CFG_MAX_FILES} 個を超えています"$'\n'
+	fi
+	if [ -n "${CFG_MAX_UNCOMPRESSED_BYTES}" ] && [ "${unc}" -gt "${CFG_MAX_UNCOMPRESSED_BYTES}" ]; then
+		over="${over}  max_uncompressed_bytes: 展開後の合計 $(human_size "${unc}")(${unc} バイト)が、上限 $(human_size "${CFG_MAX_UNCOMPRESSED_BYTES}")(${CFG_MAX_UNCOMPRESSED_BYTES} バイト)を超えています"$'\n'
+	fi
+	[ -n "${over}" ] || return 0
+	err "${PROG}: Zip が、${CONFIG_NAME} に書かれた大きさの上限を超えています(Zip は出力先に置きません。タグも打ちません):"
+	printf '%s' "${over}" >&2
+	err ""
+	err "大きいファイルの上位 10 個(展開後の大きさ):"
+	# unzip -Zl の 1 行: 権限 版 OS 大きさ 種類 圧縮後 方式 日付 時刻 名前(名前は 10 番目から. 空白を含みうる). ディレクトリ(末尾 /)は除く.
+	unzip -Zl "${zip_file}" | LC_ALL=C awk '$1 ~ /^[-dlrwxsStT]{10}$/ && $0 !~ /\/$/ { sz = $4; sub(/^([^ ]+ +){9}/, ""); printf "%d\t%s\n", sz, $0 }' |
+		LC_ALL=C tr -c '[:print:]\t\n' '?' | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr | head -n 10 |
+		LC_ALL=C awk -F'\t' '{ printf "  %12d バイト  %s\n", $1, $2 }' >&2
+	print_top_level_breakdown "${slug}" "${zip_file}" >&2
+	exit "${EXIT_STOP}"
+}
+
+# 作った Zip の要約を出す(ファイル数・サイズ・SHA-256・上限・一番上のフォルダーの直下の内訳).
 #   $1 = スラッグ / $2 = Zip のパス
 print_zip_summary() {
 	local slug="$1" zip_file="$2" bytes
@@ -954,14 +1094,115 @@ print_zip_summary() {
 	printf 'Zip:        %s\n' "${zip_file}"
 	printf 'サイズ:     %s (%s バイト)\n' "$(human_size "${bytes}")" "${bytes}"
 	printf 'SHA-256:    %s\n' "$(sha256_of "${zip_file}")"
-	if command -v unzip >/dev/null 2>&1; then
-		printf '中身:       %s\n' "$(unzip -Zt "${zip_file}" | sed 's/^[[:space:]]*//')"
-		printf '\n%s/ の直下(ファイル数 名前):\n' "${slug}"
-		# 一番上のフォルダーの直下の名前ごとに、ファイル数を数える(末尾が '/' のディレクトリのエントリは数えない).
-		# LC_ALL=C: ASCII 以外のファイル名でも落ちないように. macOS の unzip は、ASCII 以外のバイトの一部を '?' に置き換え、
-		# 残りは不正な UTF-8 のまま出す. 端末を崩さないよう、印字できないバイトを '?' にそろえてから数える.
-		unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '$0 !~ /\/$/ && NF >= 2 && $2 != "" { c[$2]++ } END { for (k in c) printf "  %5d  %s\n", c[k], k }' | LC_ALL=C sort -k2 | head -n 40
+	printf '中身:       %s\n' "$(unzip -Zt "${zip_file}" | sed 's/^[[:space:]]*//')"
+	print_limits_line
+	print_top_level_breakdown "${slug}" "${zip_file}"
+}
+
+# 一番上のフォルダーの直下の内訳(ファイル数 名前)を出す. $1 = スラッグ / $2 = Zip のパス
+print_top_level_breakdown() {
+	local slug="$1" zip_file="$2"
+	printf '\n%s/ の直下(ファイル数 名前):\n' "${slug}"
+	# 一番上のフォルダーの直下の名前ごとに、ファイル数を数える(末尾が '/' のディレクトリのエントリは数えない).
+	# LC_ALL=C: ASCII 以外のファイル名でも落ちないように. macOS の unzip は、ASCII 以外のバイトの一部を '?' に置き換え、
+	# 残りは不正な UTF-8 のまま出す. 端末を崩さないよう、印字できないバイトを '?' にそろえてから数える.
+	unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '$0 !~ /\/$/ && NF >= 2 && $2 != "" { c[$2]++ } END { for (k in c) printf "  %5d  %s\n", c[k], k }' | LC_ALL=C sort -k2 | head -n 40
+}
+
+# --- JSON のレポート(--json) --------------------------------------------------------------------
+
+# 文字列($1)を JSON の文字列の中身(両端の " を除く)にして標準出力へ出す.
+# 変えるもの: \ と " と制御文字(0x00〜0x1f. \n・\t・\r・\b・\f はその書き方、ほかは \u00XX). ASCII 以外のバイトは、そのまま出す(UTF-8 前提).
+# 改行を含む文字列も 1 つの値として扱うため、行ごとに処理して \n でつなぐ. 末尾の改行が落ちないよう、番兵の '_' を付けて渡し、最後に外す.
+json_escape() {
+	printf '%s_' "$1" | LC_ALL=C awk '
+		BEGIN {
+			for (i = 1; i < 32; i++) m[sprintf("%c", i)] = sprintf("\\u%04x", i)
+			m["\t"] = "\\t"; m["\r"] = "\\r"; m["\b"] = "\\b"; m["\f"] = "\\f"
+		}
+		{
+			n = length($0); out = ""
+			for (i = 1; i <= n; i++) {
+				ch = substr($0, i, 1)
+				if (ch == "\\") out = out "\\\\"
+				else if (ch == "\"") out = out "\\\""
+				else if (ch in m) out = out m[ch]
+				else out = out ch
+			}
+			res = (NR > 1 ? res "\\n" : "") out
+		}
+		END { printf "%s", substr(res, 1, length(res) - 1) }
+	'
+}
+
+# JSON の文字列の値(両端の " つき). $1 = 文字列. 空なら null にしたいときは、呼び出し側が json_str_or_null を使う.
+json_str() {
+	printf '"%s"' "$(json_escape "$1")"
+}
+
+# 空なら null、あれば JSON の文字列.
+json_str_or_null() {
+	if [ -z "$1" ]; then
+		printf 'null'
+	else
+		json_str "$1"
 	fi
+}
+
+# 今の時刻を ISO 8601(ローカル時刻 + オフセット. 例: 2026-10-28T16:30:00+09:00)で標準出力へ出す.
+# date の %z は +0900 の形(コロンなし)なので、コロンを入れる.
+iso_now() {
+	date '+%Y-%m-%dT%H:%M:%S%z' | sed 's/\([+-][0-9][0-9]\)\([0-9][0-9]\)$/\1:\2/'
+}
+
+# レポートの JSON を作って、$1 のパスへ上書きせずに置く. 置けなければ、メッセージを出して 1 を返す(Zip とタグは、そのまま残す).
+# 値は、作り終えた Zip とタグから読む(内容の指紋・ファイル数は make_zip の走査の結果と同じもの).
+#   $1 = 置くパス / $2 = スラッグ / $3 = 種類 / $4 = 版 / $5 = 動作(build か rebuild) / $6 = タグ名 / $7 = コミット(フルのハッシュ)
+#   $8 = ブランチ(build のときだけ. 空なら null) / $9 = Zip のパス / ${10} = マニフェストのパス(無ければ空) / ${11} = 1 なら署名付き(--sign)
+#   ${12} = --rebuild の内容の比較(1 = 一致・0 = 不一致・空 = 記録なし. build では使わない)
+write_json_report() {
+	local dest="$1" slug="$2" kind="$3" ver="$4" action="$5" tag="$6" commit="$7" branch="$8" zip_file="$9"
+	local manifest_path="${10}" sign="${11}" match="${12}" tmp bytes unc
+	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || { err "${PROG}: 一時ディレクトリが無く、JSON を作れません."; return 1; }
+	tmp="${TMP_WORK}/report.json"
+	bytes="$(wc -c <"${zip_file}")"
+	bytes=$((bytes))
+	unc="$(zip_uncompressed_bytes "${zip_file}")" || unc=""
+	{
+		printf '{\n'
+		printf '  "tool_version": %s,\n' "$(json_str "${WP_RELEASE_ZIP_MAKER_VERSION}")"
+		printf '  "slug": %s,\n' "$(json_str "${slug}")"
+		printf '  "kind": %s,\n' "$(json_str "${kind}")"
+		printf '  "version": %s,\n' "$(json_str "${ver}")"
+		printf '  "action": %s,\n' "$(json_str "${action}")"
+		printf '  "tag": %s,\n' "$(json_str "${tag}")"
+		printf '  "commit": %s,\n' "$(json_str "${commit}")"
+		printf '  "branch": %s,\n' "$(json_str_or_null "${branch}")"
+		printf '  "zip": %s,\n' "$(json_str "${zip_file}")"
+		printf '  "bytes": %s,\n' "${bytes}"
+		printf '  "sha256": %s,\n' "$(json_str "$(sha256_of "${zip_file}")")"
+		printf '  "content_sha256": %s,\n' "$(json_str_or_null "$(zip_content_digest)")"
+		printf '  "files": %s,\n' "$(zip_file_count "${zip_file}")"
+		printf '  "uncompressed_bytes": %s,\n' "${unc:-null}"
+		printf '  "manifest": %s,\n' "$(json_str_or_null "${manifest_path}")"
+		printf '  "signed": %s,\n' "$([ "${sign}" -eq 1 ] && echo true || echo false)"
+		printf '  "built_with": {\n'
+		printf '    "wp_cli": %s,\n' "$(json_str "$(wp_cli_version)")"
+		printf '    "dist_archive": %s,\n' "$(json_str "$(dist_archive_version)")"
+		printf '    "zip": %s\n' "$(json_str "$(zip_version)")"
+		printf '  },\n'
+		if [ "${action}" = rebuild ]; then
+			case "${match}" in
+				1) printf '  "content_match": true,\n' ;;
+				0) printf '  "content_match": false,\n' ;;
+				*) printf '  "content_match": null,\n' ;;
+			esac
+		fi
+		printf '  "created_at": %s\n' "$(json_str "$(iso_now)")"
+		printf '}\n'
+	} >"${tmp}" || { err "${PROG}: JSON を一時ファイルへ書けませんでした."; return 1; }
+	publish_zip "${tmp}" "${dest}" "JSON のレポート" 1 || return 1
+	printf 'JSON:       %s\n' "${dest}"
 }
 
 # --- タグ ---------------------------------------------------------------------------------------
@@ -1050,14 +1291,18 @@ check_git_identity() {
 # メッセージ: 1 行目 = '<スラッグ> <版>'. 本文 = Zip の名前・SHA-256・内容の指紋・ツールの版・Zip を作った道具(WP-CLI・dist-archive・zip)の版.
 #   SHA-256         = 配布した Zip そのもの(バイト列)の SHA-256. 手元の Zip が配布したものと同じかを確かめるための記録.
 #   Content-SHA-256 = Zip の内容の指紋(zip_content_digest). --rebuild が、作り直した Zip の内容と比べる.
-#                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. unzip が無ければこの行は書かない.
+#                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. 必ず書く(展開できなければタグを打たずに止める).
 create_tag() {
 	local tag="$1" commit="$2" slug="$3" ver="$4" zip_file="$5" sign="${6:-0}" content tagopt="-a"
 	[ "${sign}" -eq 0 ] || tagopt="-s"
-	content="$(zip_content_digest "${zip_file}")" || content=""
+	content="$(zip_content_digest)" || content=""
+	if [ -z "${content}" ]; then
+		err "${PROG}: Zip を展開できず、内容の指紋を作れません(指紋のないタグは打ちません)."
+		return 1
+	fi
 	{
 		printf '%s %s\n\nZip: %s\nSHA-256: %s\n' "${slug}" "${ver}" "$(basename "${zip_file}")" "$(sha256_of "${zip_file}")"
-		[ -z "${content}" ] || printf 'Content-SHA-256: %s\n' "${content}"
+		printf 'Content-SHA-256: %s\n' "${content}"
 		printf 'Built-with: %s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
 		printf 'WP-CLI: %s\n' "$(wp_cli_version)"
 		printf 'dist-archive: %s\n' "$(dist_archive_version)"
@@ -1088,11 +1333,14 @@ tree_path_of() {
 }
 
 # ref の時点に、設定ファイルからの相対パス $2 のファイル(またはディレクトリ)があるか. $1 = ref.
+# 使い道は、設定ファイルからの相対パスで読むもの(.distignore・check の対象のファイル)だけ.
+# 版の読み取りには使わない: 版は read_version_in と src_*(作業ツリーと ref の違いを閉じ込めた入口)の 1 か所で読む(2026-10-28 のレビュー 4 への回答).
 blob_exists() {
 	git -C "${GIT_TOP}" cat-file -e "${1}:${PREFIX}${2}" 2>/dev/null
 }
 
 # ref の時点の、設定ファイルからの相対パス $2 のファイルの中身を標準出力へ出す. $1 = ref.
+# blob_exists と同じく、.distignore・check の対象のファイルを読むためのもの. 版の読み取りには使わない(read_version_in と src_* を使う).
 blob_cat() {
 	git -C "${GIT_TOP}" show "${1}:${PREFIX}${2}" 2>/dev/null
 }
@@ -1111,10 +1359,28 @@ read_version_at() {
 
 # --- build / --dry-run / --rebuild --------------------------------------------------------------
 
+# --dry-run --verify-content: Zip を一時ディレクトリに作り、本番と同じ確認(make_zip の中の検査・大きさの上限・名前の警告)をして、
+# サマリーを出し、Zip を消す. 出力先・タグ・マニフェストには何も作らない(make_zip に、置かないと伝える).
+# --rebuild のときは、タグの記録の指紋との比較も出す(確認だけなので、違っても止めない).
+# 確認に落ちたときは、本番と同じメッセージで止まる(終了コード 1). 一時ディレクトリは、終了時に cleanup_tmp が消す.
+#   $1 = スラッグ / $2 = 対象のパス / $3 = ref / $4 = 本番なら置く Zip のパス(名前の元) / $5 = 種類 / $6 = 1 なら --rebuild / $7 = タグ名
+verify_content_run() {
+	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5" rebuild="$6" tag="$7"
+	printf '\n--- --verify-content: Zip を一時ディレクトリに作り、中身まで確かめます(出力先・タグ・マニフェストには何も作りません)---\n'
+	make_zip "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}" 0
+	printf '\n'
+	print_zip_summary "${slug}" "${BUILT_ZIP}"
+	[ "${rebuild}" -eq 0 ] || check_rebuild_digest "${tag}" "${BUILT_ZIP}" 0 1
+	rm -f -- "${BUILT_ZIP}"
+	printf '\n[verify-content] 中身の確認はすべて通りました. 確認用の Zip は消しました(出力先には何も作っていません).\n'
+}
+
 # 3 つの動作の事前の確認と実行.
 #   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
 #   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
 #   $7 = 1 なら、署名付きのタグを打つ(--sign. 通常の実行だけ)
+#   $8 = 1 なら、--dry-run のあと Zip を一時ディレクトリに作って中身まで確かめ、消す(--verify-content. --dry-run のときだけ)
+#   $9 = JSON のレポートを作るパス(絶対パス. 空なら作らない. --json. --dry-run とは使えない)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1122,7 +1388,7 @@ read_version_at() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" manifest_file=""
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" json_file="${9:-}" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1223,6 +1489,12 @@ cmd_build() {
 		fi
 	fi
 
+	# JSON のレポート(--json): 上書きしない. すでにあれば、何も作らずに止める(Zip とタグを作ってから分かると、記録だけが残らないため、ここで確かめる).
+	# 作る時点で置けなかったときは、Zip とタグを残したまま警告する(finish_json_report)ので、ここで防げるのは「すでにある」だけ.
+	if [ -n "${json_file}" ] && { [ -e "${json_file}" ] || [ -L "${json_file}" ]; }; then
+		die "JSON のレポートがすでにあります(${json_file}). このツールは上書きしません. 確かめて消してから実行してください."
+	fi
+
 	# マニフェスト(--manifest): Zip と同じく上書きしない. すでにあれば、何も作らずに止める(Zip だけ作ってから止まらないよう、ここで確かめる).
 	if [ "${manifest}" -eq 1 ]; then
 		manifest_file="${out}/${slug}.${ver}.manifest.txt"
@@ -1275,6 +1547,7 @@ cmd_build() {
 		printf 'Zip:        %s\n' "${zip_file}"
 		[ "${manifest}" -eq 0 ] || printf 'マニフェスト: %s\n' "${manifest_file}"
 		[ "${sign}" -eq 0 ] || printf '署名:       する(git tag -s. gpg と鍵が要ります. 署名できなければ、タグも Zip も作りません)\n'
+		[ "${verify_content}" -eq 0 ] || verify_content_run "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}" "${rebuild}" "${tag}"
 		return 0
 	fi
 
@@ -1289,7 +1562,9 @@ cmd_build() {
 		if [ "${manifest}" -eq 1 ]; then
 			write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました)."; }
 		fi
+		finish_json_report "${json_file}" "${slug}" "${kind}" "${ver}" rebuild "${tag}" "${ref}" "" "${zip_file}" "$([ "${manifest}" -eq 1 ] && printf '%s' "${manifest_file}")" 0 "${REBUILD_CONTENT_MATCH}"
 		print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
+		end_json_report
 		return 0
 	fi
 
@@ -1298,7 +1573,7 @@ cmd_build() {
 	# タグを打てなければ、Zip も消す(「タグの無い Zip」を残すと、次回の実行が止まるため).
 	# マニフェストは、タグより先に作る(作れなければ、タグを打たずに Zip も消す). タグを打てなければ、マニフェストも消す.
 	if [ "${manifest}" -eq 1 ]; then
-		write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました). unzip があるか確かめてください."; }
+		write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました). Zip を展開できるか確かめてください."; }
 	fi
 	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}" "${sign}"; then
 		rm -f -- "${zip_file}"
@@ -1309,7 +1584,26 @@ cmd_build() {
 	print_zip_summary "${slug}" "${zip_file}"
 	printf '\nタグ:       %s を打ちました(注釈付き%s・コミット %s).\n' "${tag}" "$([ "${sign}" -eq 0 ] || printf '・署名付き')" "${short}"
 	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
+	finish_json_report "${json_file}" "${slug}" "${kind}" "${ver}" build "${tag}" "${ref}" "$([ "${branch}" = "(detached HEAD)" ] || printf '%s' "${branch}")" "${zip_file}" "$([ "${manifest}" -eq 1 ] && printf '%s' "${manifest_file}")" "${sign}" ""
 	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
+	end_json_report
+}
+
+# --json の最後の始末. Zip とタグができたあと(手順の表示の前)に、レポートを作る. 作れなくても止めない(手順の表示まで進める).
+# 作れなかったら JSON_REPORT_FAILED を立て、end_json_report が、手順の表示のあとに終了コード 1 で終わる.
+# 理由: JSON は記録のためのもので、配布物ではない. Zip とタグは正しくできているので、消さない(--manifest は配布物と対なので、作れなければ Zip も消す).
+#   引数は write_json_report と同じ(最初の $1 が空なら、何もしない).
+JSON_REPORT_FAILED=0
+finish_json_report() {
+	[ -n "$1" ] || return 0
+	write_json_report "$@" || JSON_REPORT_FAILED=1
+}
+
+end_json_report() {
+	[ "${JSON_REPORT_FAILED}" -eq 1 ] || return 0
+	err ""
+	err "${PROG}: JSON のレポートを作れませんでした. Zip とタグは、正しくできています(消していません). レポートだけ、確かめてから作り直してください."
+	exit "${EXIT_STOP}"
 }
 
 # 内容が違ったとき、Zip を作った道具の版を「タグの記録 → 今回」で並べて表示する(違うものに印を付ける).
@@ -1345,21 +1639,24 @@ print_tool_version_comparison() {
 # 一致しなくてよい. 配布済みの Zip と同じか確かめたいときは、その Zip の SHA-256 を、タグに記録された SHA-256 と比べる.
 # 止める理由: 同じタグから作ったのに内容が違うのは、.distignore・zip・wp dist-archive の版などが変わって、配布する中身が変わっている状態.
 #             警告だけで手順の表示まで進むと、そのままアップロードされてしまう(2026-10-26 のレビュー). 意図した差なら --allow-content-change で続ける.
-# 止めないとき: 指紋が一致・タグに記録がない(古いタグ・軽量タグ)・指紋を計算できない(unzip が無い)は、比べようがないので警告だけ.
+# 止めないとき: 指紋が一致・タグに記録がない(古いタグ・軽量タグ)・指紋を計算できない(Zip を展開できない)は、比べようがないので警告だけ.
 #   $1 = タグ名 / $2 = 作り直した Zip のパス / $3 = 1 なら、不一致でも続ける(--allow-content-change)
+#   $4 = 1 なら、確認だけ(--dry-run --verify-content). 不一致でも止めない(Zip は一時ディレクトリのもので、どのみち消える)
 check_rebuild_digest() {
-	local tag="$1" zip_file="$2" allow="$3" now recorded mismatch=0
+	local tag="$1" zip_file="$2" allow="$3" verify_only="${4:-0}" now recorded mismatch=0
 	recorded="$(tag_recorded_field "${tag}" "Content-SHA-256")"
-	now="$(zip_content_digest "${zip_file}")" || now=""
+	now="$(zip_content_digest)" || now=""
 	printf '\nタグとの比較:\n'
 	if [ -z "${now}" ]; then
-		printf '  Zip の内容の指紋を計算できませんでした(unzip が無い?). 中身(上の内訳)を目で確かめてください.\n'
+		printf '  Zip を展開できず、内容の指紋を計算できませんでした. 中身(上の内訳)を目で確かめてください.\n'
 	elif [ -z "${recorded}" ]; then
 		printf '  タグ %s に、内容の指紋(Content-SHA-256)の記録がありません(古いタグ、または別の方法で打ったタグ). 中身(上の内訳)を目で確かめてください.\n' "${tag}"
 	elif [ "${recorded}" = "${now}" ]; then
+		REBUILD_CONTENT_MATCH=1
 		printf '  内容の指紋が、タグの記録と一致しました(元の Zip と同じファイル・同じ内容です).\n'
 	else
 		mismatch=1
+		REBUILD_CONTENT_MATCH=0
 		printf '  内容の指紋が、タグの記録と違います.\n    タグの記録: %s\n    今回:       %s\n' "${recorded}" "${now}"
 		printf '  .distignore・zip・wp dist-archive の版や、タグの後の環境の違いで、入るファイルが変わった可能性があります. 中身(上の内訳)を確かめてください.\n'
 		print_tool_version_comparison "${tag}"
@@ -1370,6 +1667,10 @@ check_rebuild_digest() {
 		printf '  (Zip 全体の SHA-256 は、作り直すたびに変わります. 配布した Zip の現物は、タグに記録された SHA-256 と照合してください: %s)\n' "${recorded}"
 	fi
 	[ "${mismatch}" -eq 1 ] || return 0
+	if [ "${verify_only}" -eq 1 ]; then
+		printf '  --verify-content は確認だけなので、止めません(本番の --rebuild では、--allow-content-change が無ければ止まります).\n'
+		return 0
+	fi
 	if [ "${allow}" -eq 1 ]; then
 		printf '  --allow-content-change が指定されているので続行します.\n'
 		return 0
@@ -1451,7 +1752,7 @@ print_deploy_hint() {
 	name="${slug}.${ver}"
 	# Zip に VERSION が入っているか(サーバーで版を確かめる行を出せるか).
 	has_version=0
-	if command -v unzip >/dev/null 2>&1 && unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/VERSION"; then
+	if unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/VERSION"; then
 		has_version=1
 	fi
 
@@ -1530,7 +1831,7 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 verify_content=0 json_file=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
@@ -1539,6 +1840,20 @@ main() {
 			--allow-content-change) allow_change=1 ;;
 			--manifest) manifest=1 ;;
 			--sign) sign=1 ;;
+			--verify-content) verify_content=1 ;;
+			--json)
+				# 値は次の引数. 無い・空・オプションの形('-' で始まる)なら使い方の誤り.
+				if [ "$#" -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
+					err "${PROG}: --json にはレポートを作るパスを付けてください(例: --json report.json)."
+					exit "${EXIT_USAGE}"
+				fi
+				# カレントからの相対パスは、ここで絶対パスにする(以後 cd しても変わらない).
+				case "$2" in
+					/*) json_file="$(normalize_path "$2")" ;;
+					*) json_file="$(normalize_path "${PWD}/$2")" ;;
+				esac
+				shift
+				;;
 			-*)
 				err "${PROG}: 不明なオプション '$1'"
 				err "'${PROG} --help' で使い方を確認してください."
@@ -1560,7 +1875,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${verify_content}" -eq 1 ] || [ -n "${json_file}" ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1590,7 +1905,19 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}"
+	# --verify-content は、--dry-run の確認を、Zip を作るところまで広げるもの. --dry-run が無ければ、本番の実行が Zip を作るので意味がない.
+	if [ "${verify_content}" -eq 1 ] && [ "${dry}" -eq 0 ]; then
+		err "${PROG}: --verify-content は --dry-run と一緒にだけ指定できます(Zip を一時ディレクトリに作って中身まで確かめ、消すためのものです)."
+		exit "${EXIT_USAGE}"
+	fi
+
+	# --json は、成功したあとのレポート. --dry-run は何も作らないので、一緒には使えない.
+	if [ -n "${json_file}" ] && [ "${dry}" -eq 1 ]; then
+		err "${PROG}: --json は --dry-run と一緒に使えません(--dry-run は何も作らないので、レポートに書く Zip がありません)."
+		exit "${EXIT_USAGE}"
+	fi
+
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}" "${json_file}"
 }
 
 main "$@"

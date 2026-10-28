@@ -72,6 +72,28 @@ test_config_errors_stop_with_a_reason() {
 	expect_config_error "先頭のドットのスラッグ" "スラッグ '.hidden'" $'output = ../r\nplugin a/x .hidden'
 }
 
+# 大きさの上限(max_*)の誤り: 正の整数と、末尾の K・M・G だけが書ける. 行番号つきで止まる.
+test_size_limit_errors_stop_with_a_reason() {
+	mk_docroot limerr
+	expect_config_error "0" ".wp-release:2: max_zip_bytes は、正の整数で書いてください" $'output = ../r\nmax_zip_bytes = 0\nplugin a/x'
+	expect_config_error "小数" ".wp-release:2: max_files は、正の整数で書いてください" $'output = ../r\nmax_files = 1.5\nplugin a/x'
+	expect_config_error "負の数" "max_uncompressed_bytes は、正の整数で書いてください" $'output = ../r\nmax_uncompressed_bytes = -5\nplugin a/x'
+	expect_config_error "単位だけ" "max_zip_bytes は、正の整数で書いてください" $'output = ../r\nmax_zip_bytes = M\nplugin a/x'
+	expect_config_error "知らない単位" "max_zip_bytes は、正の整数で書いてください" $'output = ../r\nmax_zip_bytes = 20MB\nplugin a/x'
+	expect_config_error "桁が多すぎる" "max_zip_bytes は、正の整数で書いてください" $'output = ../r\nmax_zip_bytes = 9999999999999\nplugin a/x'
+	expect_config_error "2 回" "max_files が 2 回書かれています" $'output = ../r\nmax_files = 5\nmax_files = 6\nplugin a/x'
+	expect_config_error "値が空" "max_files の値が空です" $'output = ../r\nmax_files =\nplugin a/x'
+}
+
+# 上限の書き方(正常): 整数・K・M・G(小文字も)・先頭の 0 を含む値. --list も、書き方の誤りがなければ通る.
+test_size_limits_are_accepted() {
+	mk_docroot limok
+	printf 'output = %s\nmax_zip_bytes = 20M\nmax_files = 08\nmax_uncompressed_bytes = 1g  # 末尾のコメント\nplugin %s\n' "${OUTD}" "${P}" > "${BASE}/.wp-release"
+	run_tool --list
+	assert_rc 0
+	assert_has "my-plugin"
+}
+
 # --- 設定の読み方(正常) --------------------------------------------------------------------------
 
 test_config_comments_and_spacing_are_accepted() {

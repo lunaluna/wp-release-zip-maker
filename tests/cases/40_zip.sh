@@ -290,6 +290,315 @@ test_manifest_lists_every_file_with_its_sha256() {
 	(cd "${x}" && shasum -a 256 -c "${mf}" >/dev/null 2>&1) && fail "改ざんしたのに、照合が通りました"
 }
 
+# --dry-run --verify-content: 一時ディレクトリに Zip を作って本番と同じ確認をし、サマリーを出して消す.
+# 出力先(ディレクトリごと)・タグ・マニフェストには何も作らず、一時ディレクトリも残さない.
+test_verify_content_builds_checks_and_leaves_nothing() {
+	need_real_wp || return 0
+	mk_docroot vc1
+	run_tool my-plugin --dry-run --verify-content --manifest
+	assert_rc 0
+	assert_has "[dry-run] Zip もタグも作りません"
+	assert_has "--verify-content:"
+	assert_has "SHA-256:"
+	assert_has "my-plugin/ の直下"
+	assert_has "中身の確認はすべて通りました"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+	LABEL="付けなければ Zip を作らない"
+	run_tool my-plugin --dry-run
+	assert_rc 0
+	assert_lacks "--verify-content:"
+}
+
+# 本番と同じ確認に落ちたら、止まる(配布してはいけないファイル・大きさの上限). 何も作らない.
+test_verify_content_stops_on_the_same_checks_as_the_real_run() {
+	need_real_wp || return 0
+	mk_docroot vc2
+	commit_forbidden_files "${FORBIDDEN_FILES}"
+	LABEL="配布してはいけないファイル"
+	run_tool my-plugin --dry-run --verify-content
+	assert_rc 1
+	assert_has "配布してはいけないファイル"
+	assert_lacks "中身の確認はすべて通りました"
+	assert_no_file "${OUTD}"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+	mk_docroot vc3
+	set_config "output = ${OUTD}
+max_files = 1
+plugin ${P}"
+	LABEL="大きさの上限"
+	run_tool my-plugin --dry-run --verify-content
+	assert_rc 1
+	assert_has "max_files: ファイルの数"
+	assert_no_file "${OUTD}"
+	LABEL="--dry-run だけなら、上限は確かめない(Zip を作らないため)"
+	run_tool my-plugin --dry-run
+	assert_rc 0
+}
+
+# --- --json(機械が読めるレポート) ---------------------------------------------------------------
+
+# JSON のファイル($1)から、キー($2. 入れ子は a.b)の値を文字列で出す(null は 'null'). jq があれば jq、無ければ python3 で読む.
+# どちらも無ければ、何も出さずに 1 を返す(呼び出し側が SKIP にする).
+json_get() {
+	if command -v jq >/dev/null 2>&1; then
+		jq -r --arg k "$2" 'getpath($k | split(".")) | if . == null then "null" else tostring end' "$1"
+	elif command -v python3 >/dev/null 2>&1; then
+		python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1], encoding="utf-8"))
+for k in sys.argv[2].split("."):
+    d=d[k]
+print("null" if d is None else str(d).lower() if isinstance(d,bool) else d)' "$1" "$2"
+	else
+		return 1
+	fi
+}
+
+have_json_reader() {
+	command -v jq >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1
+}
+
+# build の --json: 中身が、実際の Zip・タグ・コミットと一致すること. 相対パスはカレントから. 上書きしない.
+test_json_report_for_build() {
+	need_real_wp || return 0
+	have_json_reader || { skip "jq も python3 も無い(JSON を読めない)"; return 0; }
+	mk_docroot j1
+	run_tool my-plugin --json report.json --manifest
+	assert_rc 0
+	assert_has "JSON:       $(pwd -P)/report.json"
+	local j="report.json" z="${OUTD}/my-plugin.1.2.3.zip"
+	assert_file "${j}"
+	assert_eq "$(sed -n 's/^WP_RELEASE_ZIP_MAKER_VERSION="\(.*\)"$/\1/p' "${TOOL}" | head -n 1)" "$(json_get "${j}" tool_version)" "tool_version"
+	assert_eq "my-plugin" "$(json_get "${j}" slug)" "slug"
+	assert_eq "plugin" "$(json_get "${j}" kind)" "kind"
+	assert_eq "1.2.3" "$(json_get "${j}" version)" "version"
+	assert_eq "build" "$(json_get "${j}" action)" "action"
+	assert_eq "my-plugin/1.2.3" "$(json_get "${j}" tag)" "tag"
+	assert_eq "$(git rev-parse HEAD)" "$(json_get "${j}" commit)" "commit"
+	assert_eq "main" "$(json_get "${j}" branch)" "branch"
+	assert_eq "${z}" "$(json_get "${j}" zip)" "zip のパス"
+	assert_eq "$(wc -c < "${z}" | tr -d ' ')" "$(json_get "${j}" bytes)" "bytes"
+	assert_eq "$(shasum -a 256 "${z}" | cut -d' ' -f1)" "$(json_get "${j}" sha256)" "sha256"
+	assert_eq "$(git tag -l --format='%(contents)' my-plugin/1.2.3 | sed -n 's/^Content-SHA-256: //p')" "$(json_get "${j}" content_sha256)" "content_sha256(タグの記録と同じ)"
+	assert_eq "$(unzip -Z1 "${z}" | grep -vc '/$')" "$(json_get "${j}" files)" "files"
+	assert_eq "${OUTD}/my-plugin.1.2.3.manifest.txt" "$(json_get "${j}" manifest)" "manifest"
+	assert_eq "false" "$(json_get "${j}" signed)" "signed"
+	[ "$(json_get "${j}" built_with.wp_cli)" != "null" ] || fail "built_with.wp_cli がありません"
+	[ "$(json_get "${j}" built_with.dist_archive)" != "null" ] || fail "built_with.dist_archive がありません"
+	[ "$(json_get "${j}" built_with.zip)" != "null" ] || fail "built_with.zip がありません"
+	json_get "${j}" created_at | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[+-][0-9]{2}:[0-9]{2}$' || fail "created_at が ISO 8601 の形ではありません: $(json_get "${j}" created_at)"
+	grep -q content_match "${j}" && fail "build の JSON に content_match があります"
+	# 展開後の大きさは、数字(読めなければ null)
+	json_get "${j}" uncompressed_bytes | grep -Eq '^[0-9]+$' || fail "uncompressed_bytes が数字ではありません: $(json_get "${j}" uncompressed_bytes)"
+	# マニフェストを付けなければ null
+	mk_docroot j1b
+	run_tool my-plugin --json r2.json
+	assert_rc 0
+	assert_eq "null" "$(json_get r2.json manifest)" "manifest(--manifest なし)"
+}
+
+# --rebuild の --json: action = rebuild・content_match(記録と一致なら true)・branch は null(タグの時点から作るため).
+test_json_report_for_rebuild() {
+	need_real_wp || return 0
+	have_json_reader || { skip "jq も python3 も無い(JSON を読めない)"; return 0; }
+	mk_docroot j2
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	run_tool my-plugin --rebuild --json "${TEST_ROOT}/rb.json"
+	assert_rc 0
+	local j="${TEST_ROOT}/rb.json"
+	assert_eq "rebuild" "$(json_get "${j}" action)" "action"
+	assert_eq "true" "$(json_get "${j}" content_match)" "content_match"
+	assert_eq "null" "$(json_get "${j}" branch)" "branch"
+	assert_eq "my-plugin/1.2.3" "$(json_get "${j}" tag)" "tag"
+	assert_eq "$(git rev-parse HEAD)" "$(json_get "${j}" commit)" "commit(タグのコミット)"
+	assert_eq "$(git tag -l --format='%(contents)' my-plugin/1.2.3 | sed -n 's/^Content-SHA-256: //p')" "$(json_get "${j}" content_sha256)" "content_sha256"
+}
+
+# すでにある JSON は上書きしない. 何も作らずに止める(Zip・タグも). 中身も変えない.
+test_json_report_is_never_overwritten() {
+	need_real_wp || return 0
+	mk_docroot j3
+	# リポジトリの外に置く(中に置くと、未追跡ファイルとして作業ツリーの確認で先に止まる)
+	echo mine > "${TEST_ROOT}/exists.json"
+	run_tool my-plugin --json "${TEST_ROOT}/exists.json"
+	assert_rc 1
+	assert_has "JSON のレポートがすでにあります"
+	assert_eq "mine" "$(cat "${TEST_ROOT}/exists.json")" "既存の JSON"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+}
+
+# パスに ダブルクォート・バックスラッシュ・改行 があっても、JSON が壊れず、元の文字列に戻ること.
+test_json_report_escapes_special_characters() {
+	need_real_wp || return 0
+	have_json_reader || { skip "jq も python3 も無い(JSON を読めない)"; return 0; }
+	mk_docroot j4
+	local odd="${TEST_ROOT}/q\"uote\\back"
+	set_config "output = ${odd}
+plugin ${P}"
+	run_tool my-plugin --json "${TEST_ROOT}/j4.json"
+	assert_rc 0
+	assert_eq "${odd}/my-plugin.1.2.3.zip" "$(json_get "${TEST_ROOT}/j4.json" zip)" "zip のパス(\" と \\ を含む)"
+	# 改行を含む出力先も(JSON では \n になる)
+	mk_docroot j5
+	local nl="${TEST_ROOT}/line
+break"
+	set_config "output = ${nl}
+plugin ${P}"
+	run_tool my-plugin --json "${TEST_ROOT}/j5.json"
+	if [ "${RC}" -eq 0 ]; then
+		assert_eq "${nl}/my-plugin.1.2.3.zip" "$(json_get "${TEST_ROOT}/j5.json" zip)" "zip のパス(改行を含む)"
+		grep -q 'line\\nbreak' "${TEST_ROOT}/j5.json" || fail "改行が \\n になっていません"
+	else
+		# 設定ファイルは 1 行 1 項目なので、改行入りの出力先は設定に書けない. その場合は、設定の誤りで止まることだけ確かめる.
+		assert_rc 1
+	fi
+}
+
+# JSON を置けなかったとき(置き場所の親がファイル): Zip とタグは残し、手順は表示し、警告して終了コード 1.
+test_json_report_failure_keeps_the_zip_and_the_tag() {
+	need_real_wp || return 0
+	mk_docroot j6
+	echo file > "${TEST_ROOT}/notadir"
+	run_tool my-plugin --json "${TEST_ROOT}/notadir/report.json"
+	assert_rc 1
+	assert_has "JSON のレポートを作れませんでした. Zip とタグは、正しくできています"
+	assert_has "アップロード: 管理画面の"   # plugin の手順(失敗しても、手順の表示まで進む)
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "my-plugin/1.2.3" "$(git tag)" "タグ(そのまま)"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+}
+
+# 大きさの上限(max_zip_bytes・max_files・max_uncompressed_bytes): 超えたら止める. 出力先に Zip を置かず、タグも打たない.
+# 超えた項目と値・大きいファイルの上位 10 個・直下の内訳を出す. 上限以下なら進み、サマリーに「上限:」を出す.
+test_size_limits_stop_when_exceeded() {
+	need_real_wp || return 0
+	local z key
+	for key in "max_zip_bytes = 1" "max_files = 1" "max_uncompressed_bytes = 1"; do
+		mk_docroot lim_"${key%% *}"
+		z="${OUTD}/my-plugin.1.2.3.zip"   # OUTD は mk_docroot ごとに変わる
+		LABEL="${key}"
+		set_config "output = ${OUTD}
+${key}
+plugin ${P}"
+		run_tool my-plugin
+		assert_rc 1
+		assert_has "大きさの上限を超えています"
+		assert_has "${key%% *}:"
+		assert_has "大きいファイルの上位 10 個"
+		assert_has "my-plugin/ の直下"
+		assert_no_file "${z}"
+		assert_eq "" "$(git tag)" "上限超えで打たれたタグ"
+		assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+	done
+}
+
+# 上限を超えた項目だけが表示に出ること(超えていない項目は出さない)・大きいファイルが大きさ順に並ぶこと.
+test_size_limit_report_lists_only_the_exceeded_items_and_orders_files() {
+	need_real_wp || return 0
+	mk_docroot lim_rep
+	head -c 5000 /dev/zero | tr '\0' 'a' > "${P}/big file.txt"   # 空白入りの名前. 一番大きいファイルにする
+	gcommit "big"
+	set_config "output = ${OUTD}
+max_files = 1
+max_zip_bytes = 20M
+plugin ${P}"
+	run_tool my-plugin
+	assert_rc 1
+	assert_has "max_files: ファイルの数"
+	assert_lacks "max_zip_bytes:"
+	# 上位の最初の行が、一番大きいファイル(5000 バイト).
+	local first
+	first="$(printf '%s\n' "${OUT}" | sed -n '/大きいファイルの上位 10 個/{n;p;}')"
+	case "${first}" in
+		*"5000 バイト  my-plugin/big file.txt") ;;
+		*) fail "最初の行が一番大きいファイルではありません: '${first}'" ;;
+	esac
+}
+
+test_size_limits_pass_and_show_in_the_summary() {
+	need_real_wp || return 0
+	mk_docroot lim_ok
+	set_config "output = ${OUTD}
+max_zip_bytes = 20M
+max_files = 1000
+max_uncompressed_bytes = 1G
+plugin ${P}"
+	run_tool my-plugin
+	assert_rc 0
+	assert_has "上限:       Zip 20971520 バイト・ファイル 1000 個・展開後 1073741824 バイト 以下"
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "1.2.3" "$(git tag | head -n 1)" "打たれたタグ(対象が 1 つなので {version})"
+}
+
+# ちょうど上限と同じ値は通る(超えたときだけ止める). ファイル数を実測して、その値を上限にする.
+test_size_limit_equal_to_the_value_passes() {
+	need_real_wp || return 0
+	mk_docroot lim_eq
+	run_tool my-plugin; assert_rc 0
+	local n
+	n="$(unzip -Z1 "${OUTD}/my-plugin.1.2.3.zip" | grep -vc '/$')"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	git tag -d 1.2.3 >/dev/null
+	LABEL="上限 = ファイル数(${n})"
+	set_config "output = ${OUTD}
+max_files = ${n}
+plugin ${P}"
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	git tag -d 1.2.3 >/dev/null
+	LABEL="上限 = ファイル数 - 1"
+	set_config "output = ${OUTD}
+max_files = $((n - 1))
+plugin ${P}"
+	run_tool my-plugin; assert_rc 1
+	assert_has "max_files: ファイルの数 ${n} 個が、上限 $((n - 1)) 個を超えています"
+}
+
+# --rebuild も同じ上限で止まる(Zip は作らない・タグはそのまま).
+test_size_limits_apply_to_rebuild() {
+	need_real_wp || return 0
+	mk_docroot lim_rb
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	set_config "tag_format = {slug}/{version}
+output = ${OUTD}
+max_files = 1
+plugin ${P}"
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "大きさの上限を超えています"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "my-plugin/1.2.3" "$(git tag | head -n 1)" "タグ(そのまま)"
+}
+
+# Zip の展開(unzip -d)は、build でも --rebuild でも、--manifest を付けても 1 回だけであること(1.1.0 までは、指紋とマニフェストで別々に展開した).
+# 指紋とマニフェストは同じ走査の結果から作る(マニフェストの各行の中身の一致は、上のテストが shasum -c で確かめる).
+# 展開の回数は、unzip の前に置いた記録用のラッパーで数える(展開する呼び出しは -d を持つ. 一覧の -Z1・-Zt・-p は数えない).
+test_zip_is_extracted_only_once() {
+	need_real_wp || return 0
+	local wrap="${TEST_ROOT}/unzip-wrap" log="${TEST_ROOT}/unzip-calls.log" real
+	real="$(command -v unzip)"
+	mkdir -p "${wrap}"
+	printf '#!/bin/sh\nfor a in "$@"; do if [ "$a" = "-d" ]; then echo extract >> "%s"; fi; done\nexec "%s" "$@"\n' "${log}" "${real}" > "${wrap}/unzip"
+	chmod +x "${wrap}/unzip"
+	mk_docroot once1
+	LABEL="build --manifest"
+	: > "${log}"
+	run_tool_env "PATH=${wrap}:${PATH}" -- my-plugin --manifest
+	assert_rc 0
+	assert_eq "1" "$(wc -l < "${log}" | tr -d ' ')" "build での展開の回数"
+	LABEL="--rebuild --manifest"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip" "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	: > "${log}"
+	run_tool_env "PATH=${wrap}:${PATH}" -- my-plugin --rebuild --manifest
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と一致しました"
+	assert_eq "1" "$(wc -l < "${log}" | tr -d ' ')" "--rebuild での展開の回数"
+}
+
 # マニフェストがすでにあるときは、何も作らずに止めること(Zip・タグも). 壊れたシンボリックリンクも「ある」とみなす.
 test_existing_manifest_stops_before_anything_is_made() {
 	need_real_wp || return 0
