@@ -25,8 +25,8 @@ extract_rollback() {
 test_plugin_and_theme_get_the_admin_upload_hint() {
 	need_real_wp || return 0
 	mk_docroot h1
-	LABEL="plugin"; run_tool my-plugin; assert_rc 0; assert_has "プラグインの追加 > プラグインのアップロード"; assert_lacks "scp "
-	LABEL="theme"; run_tool my-theme; assert_rc 0; assert_has "テーマの追加 > テーマのアップロード"
+	LABEL="plugin"; run_tool my-plugin; assert_rc 0; assert_has "プラグイン > プラグインを追加 > プラグインのアップロード"; assert_lacks "scp "
+	LABEL="theme"; run_tool my-theme; assert_rc 0; assert_has "外観 > テーマ > テーマを追加 > テーマのアップロード"
 }
 
 test_dir_hint_for_the_first_release() {
