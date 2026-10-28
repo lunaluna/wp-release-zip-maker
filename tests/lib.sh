@@ -190,7 +190,7 @@ have_dist_archive() {
 HAVE_REAL_WP=""
 
 # 実物の wp dist-archive が無ければ、そのテストを飛ばす(SKIP にする). 使い方(テストの先頭): need_real_wp || return 0
-# run.sh を --all なしで流したとき(WRZM_QUICK=1)も飛ばす. 全部を流すと約 5 分かかるため(時間の大半が、これらのテスト).
+# run.sh を --all なしで流したとき(WRZM_QUICK=1)も飛ばす. 全部を流すと約 2 分半かかるため(時間の大半が、これらのテスト).
 # 飛ばしたテストの名前を WRZM_QUICK_LOG に書き、run.sh が最後に件数を数えて表示する.
 # テストの関数は、tests_main からサブシェルを作らずに呼ばれるので、HAVE_REAL_WP への代入は次のテストにも残る.
 need_real_wp() {

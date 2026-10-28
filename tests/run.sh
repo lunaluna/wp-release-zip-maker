@@ -3,14 +3,14 @@
 # テストの入口. tests/cases/*.sh を、1 ファイルずつ別プロセスで流して、結果をまとめる.
 #
 #   tests/run.sh                     速いテストだけ(shellcheck も含む). 実物の WP-CLI が要るテストは飛ばす
-#   tests/run.sh --all               すべて(実物の WP-CLI で Zip を作るテストも. 約 5 分)
+#   tests/run.sh --all               すべて(実物の WP-CLI で Zip を作るテストも. 約 2 分半)
 #   tests/run.sh cli                 ファイル名に 'cli' を含むケースだけ
 #   tests/run.sh cli version         そのファイルの中で、テスト名に 'version' を含むものだけ
 #   tests/run.sh --all zip rebuild   絞り込みと --all は組み合わせられる(--all はどこに書いてもよい)
 #   tests/run.sh --list              流さずに、ファイルごとの件数と目安の時間を一覧にする(絞り込みも効く)
 #
 # --all が無ければ、絞り込みの有無にかかわらず、実物の WP-CLI が要るテストは飛ばす(2026-10-28 のユーザーの決定).
-# 全部を流すと約 5 分かかるため. リリースの前(版を上げる前)には --all を必ず流す.
+# 全部を流すと約 2 分半かかるため. リリースの前(版を上げる前)には --all を必ず流す.
 #
 # 環境変数:
 #   WRZM_BASH   ツールを動かす bash(既定 /bin/bash. macOS では 3.2 なので、3.2 互換の確認になる)
@@ -68,20 +68,20 @@ total_files=0
 
 # ファイルごとの目安の秒数. 始める前に合計を表示し、時間がかかることを先に知らせるために使う.
 #   $1 = ファイルの名前(lint・10_cli など) / $2 = all(--all のとき)・quick(速いテストだけのとき)
-# 2026-10-28 に、この Mac のサンドボックスの中で実測した値. 測り直したら直す(README の「開発・テスト」も).
+# 2026-10-28 に、この Mac のサンドボックスの中で実測した値(--all は 1.1.0 のステップ 4 のあとで 2 分 34 秒. 30_preflight は 14〜19 秒で揺れる). 測り直したら直す(README の「開発・テスト」も).
 # 時間の大半は、実物の WP-CLI で Zip を作る 40_zip・50_tag_rebuild・60_deploy_hint(--all のときだけ流す).
 # 目安が無いファイル(新しく足したもの)は 0 を返す. 合計の表示で、目安の無いファイルがあることを添える.
 estimate_seconds() {
 	case "$1:$2" in
-		lint:*) echo 4 ;;
+		lint:*) echo 3 ;;
 		10_cli:*) echo 1 ;;
-		20_config:*) echo 3 ;;
-		30_preflight:*) echo 14 ;;
-		40_zip:all) echo 75 ;;
+		20_config:*) echo 2 ;;
+		30_preflight:*) echo 19 ;;
+		40_zip:all) echo 41 ;;
 		40_zip:quick) echo 2 ;;
-		50_tag_rebuild:all) echo 117 ;;
+		50_tag_rebuild:all) echo 59 ;;
 		50_tag_rebuild:quick) echo 1 ;;
-		60_deploy_hint:all) echo 70 ;;
+		60_deploy_hint:all) echo 26 ;;
 		60_deploy_hint:quick) echo 1 ;;
 		*) echo 0 ;;
 	esac

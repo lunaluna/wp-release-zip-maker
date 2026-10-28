@@ -224,9 +224,10 @@ zip: 3.0
 - `Content-SHA-256` は、Zip の**内容の指紋**です。Zip を一時ディレクトリへ展開し、通常のファイルは「パスと内容の SHA-256」、実行権限のあるファイルは「パス」、シンボリックリンクは「パスとリンク先」の行を並べ替えて SHA-256 にしたものです(時刻・圧縮のしかた・空のディレクトリを含みません)。
   ファイルの内容そのものを SHA-256 にしているので、CRC-32 のように「同じ値になる別の内容」を作られる心配はありません。
   `--rebuild` が、作り直した Zip の内容と比べるのに使います。`unzip` が無いときは、この行を書きません
-- `WP-CLI`・`dist-archive`・`zip` は、**Zip を作ったときの道具の版**です(`wp --version`・`wp package list`・`zip -v` から読みます)。調べられなければ `unknown` と書き、Zip の作成は続けます。
+- `WP-CLI`・`dist-archive`・`zip` は、**Zip を作ったときの道具の版**です(`wp --version`・WP-CLI のパッケージの記録・`zip -v` から読みます)。調べられなければ `unknown` と書き、Zip の作成は続けます。
   `--rebuild` で内容が違ったとき、この記録と今の版を並べて、道具の版が変わったのかをたどれるようにするためのものです。
-  `wp package list` は約 2 秒かかるので(この Mac で実測 1.5〜2.1 秒)、Zip を作るたびにその分だけ時間が増えます
+  `dist-archive` の版は、`wp package path` で調べた場所の `vendor/composer/installed.json` から読みます(この Mac で 1 回 0.13 秒)。
+  読めなければ `wp package list` で読みます(1 回 1.5〜2.1 秒)。どちらも同じ記録が元なので、書かれる値は同じです(WP-CLI 2.12.0 のソースで確認)
 - タグを打てなかったとき(`gpg` の署名の失敗など)は、作った Zip も消します(「タグの無い Zip」を残さないため)
 
 ### 署名付きのタグ(`--sign`)
@@ -336,15 +337,51 @@ dir     lp          2.0.0      lp/2.0.0            no     lp
 テストは bash だけで書いてあります(外部のテストツールは要りません)。
 
 ```bash
-tests/run.sh                 # すべて(shellcheck を含む. 約 5 分. Zip を実際に作るテストが大半)
-tests/run.sh preflight       # ファイル名に 'preflight' を含むケースだけ
-tests/run.sh zip rebuild     # そのファイルの中で、テスト名に 'rebuild' を含むものだけ
-tests/run.sh lint            # shellcheck だけ
+tests/run.sh                   # 速いテストだけ(shellcheck を含む. 約 30 秒)。実物の WP-CLI が要るテストは飛ばす
+tests/run.sh --all             # すべて(実物の WP-CLI で Zip を作るテストも. 約 2 分半)
+tests/run.sh --list            # 流さずに、ファイルごとのテストの数・実物の WP-CLI が要る数・目安の時間を一覧にする
+tests/run.sh preflight         # ファイル名に 'preflight' を含むファイルだけ
+tests/run.sh --all zip rebuild # そのファイルの中で、テスト名に 'rebuild' を含むものだけ(--all はどこに書いてもよい)
+tests/run.sh lint              # shellcheck だけ
+tests/run.sh --help            # 使い方
 ```
 
-- **すべてのテストには、約 5 分かかります**(2026-10-28 の実測で 4 分 42 秒)。そのうち 93% は、実物の `wp dist-archive` で Zip を作る `40_zip`(75 秒)・`50_tag_rebuild`(116 秒)・`60_deploy_hint`(70 秒)です。
-  残りの lint・`10_cli`・`20_config`・`30_preflight` は、合わせて約 20 秒です。WP-CLI の起動(1 回 0.15 秒)と、タグに道具の版を記録するための `wp package list`(1 回 1.5 秒)を、Zip を作るたびに呼ぶためです
-- ケースは `tests/cases/` にあります(`10_cli`・`20_config`・`30_preflight`・`40_zip`・`50_tag_rebuild`・`60_deploy_hint`)。共通部品は `tests/lib.sh` です
+- **すべてのテストには時間がかかります。** そのため、引数なしでは速いテストだけを流し、実物の WP-CLI が要るテストは飛ばします。
+  絞り込みで重いファイルを名指ししても、`--all` が無ければ飛ばします。最後に、飛ばした件数と `--all` の案内を必ず表示します
+- **リリースの前(版を上げる前)には、必ず `--all` を流してください。** 引数なしの「すべて成功」は、重いテストを飛ばした結果です
+- 始める前に、対象のファイルの数と目安の時間を表示します。各ファイルの集計行と最後の結果に、かかった時間を出します
+
+### ファイルごとの内容と時間
+
+時間は、2026-10-28 のこの Mac での実測です(`--all`. 目安は `tests/run.sh --list` でも見られます)。
+
+| ファイル | 確かめること | テストの数 | 実物の WP-CLI が要る数 | 時間 |
+| --- | --- | --- | --- | --- |
+| lint | shellcheck の検査 | 1 | 0 | 3 秒 |
+| `10_cli` | 引数・`--help`・`--version` | 10 | 0 | 1 秒 |
+| `20_config` | 設定ファイル `.wp-release` の読み込み・`--list` | 13 | 0 | 2 秒 |
+| `30_preflight` | 事前の確認(`--dry-run`)の、止める条件のそれぞれ。偽の `wp` で動く | 32 | 0 | 19 秒 |
+| `40_zip` | Zip の作成・Zip の中身の確認・配布してはいけないファイルの検査・`--manifest` | 27 | 26 | 41 秒 |
+| `50_tag_rebuild` | 注釈付きタグとその記録(道具の版を含む)・`--rebuild`・`--sign` | 28 | 28 | 59 秒 |
+| `60_deploy_hint` | アップロード手順の表示。dir の SSH の手順は疑似サーバーで実際に実行する | 14 | 14 | 26 秒 |
+
+### 変更した場所ごとに流すファイル
+
+まず、変更に関わるファイルだけを流してください。最後に `--all` で全体を確かめます。
+
+| 変更した場所(`bin/wp-release-zip-maker`) | 流すファイル |
+| --- | --- |
+| 引数の解釈・`usage`・`print_version` | `tests/run.sh cli` |
+| 設定の読み込み(`load_config`・`validate_config`・`find_config`)・`cmd_list` | `tests/run.sh config` |
+| 事前の確認(`check_tools`・`check_clean_tree`・`check_version_files`・版の読み方) | `tests/run.sh preflight` |
+| Zip の作成と確認(`make_zip`・`publish_zip`・`verify_zip`・`scan_zip_names`・マニフェスト) | `tests/run.sh --all zip` |
+| タグ(`create_tag`・道具の版の読み方)・`--rebuild`・内容の指紋 | `tests/run.sh --all tag_rebuild` |
+| アップロード手順(`print_deploy_hint`・`previous_version`・`shell_quote`) | `tests/run.sh --all deploy_hint` |
+| どこを直しても | `tests/run.sh lint`(shellcheck) |
+
+### そのほか
+
+- ケースは `tests/cases/` にあります。共通部品は `tests/lib.sh` です
 - テストは一時ディレクトリの中だけで動きます。Git の設定(`GIT_CONFIG_GLOBAL`)と `TMPDIR` をテスト用に差し替えるので、実行する人の環境に結果が左右されません
 - 必要なもの: git 2.32 以上・unzip。**Zip を実際に作るテストは、実物の `wp dist-archive` と zip が無ければ SKIP になります**
   (事前の確認のテストは、偽の `wp` で動くので、実物が無くても通ります)
