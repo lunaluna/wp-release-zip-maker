@@ -101,7 +101,7 @@ requires   = 1.0.0                   # 省略可。このツールの最低の�
 # 種類    パス(設定ファイルからの相対)    スラッグ(省略時はディレクトリ名)
 plugin   wp-content/plugins/my-plugin
 theme    wp-content/themes/my-theme
-dir      lp                              landing
+dir      lp                              # スラッグを省くと、ディレクトリ名(lp)になる
 
 # 版の表記がそろっているかの追加の確認(任意)。check パス:正規表現
 check    wp-content/plugins/my-plugin/package.json:"version"
@@ -110,11 +110,28 @@ check    wp-content/plugins/my-plugin/package.json:"version"
 - `#` で始まる行と、空白の後ろの `#` 以降はコメントです(`check` の正規表現には、空白のあとに `#` を続けて書けません)
 - パスは設定ファイルからの相対パスです。絶対パスと `..` は使えません。パス `.` はスラッグの省略ができません
 - スラッグは英数字・ドット・ハイフン・アンダースコアだけです(先頭のドットは不可)。対象どうしで重複できません
+- **スラッグは、ディレクトリ名(サーバーに置く名前)と同じにすることを基本とします。** ふつうはスラッグを省けば、ディレクトリ名になります。
+  理由: スラッグは、Zip の一番上のフォルダー名と、サーバーで置き換える先の名前を決めるためです(下の「スラッグとディレクトリ名」)
 - 対象が複数あるときは、`tag_format` に `{slug}` を含めます(別の対象のタグが衝突するため)
 - `output` は省略できません(省略時の置き場所を決めると、Git の中に Zip を作る事故につながるため)
 - `check` は、そのパスを含む対象(`plugin`/`theme`/`dir` のディレクトリの下)の確認にだけ使います。
   たとえばプラグインとテーマの両方が入る設定で、プラグインの Zip を作るときに、テーマの `package.json` とは比べません。
   どの対象の下にもない `check` は、書き間違いとして止めます
+
+### スラッグとディレクトリ名
+
+**スラッグは、ディレクトリ名(サーバーに置く名前)と同じにすることを基本とします。**
+スラッグは、Zip の名前とタグ名のほかに、次の 2 つを決めます。ディレクトリ名と違うと、サーバーで置き換わる先がずれます。
+
+| 種類 | スラッグで決まるもの | ディレクトリ名と違うと |
+| --- | --- | --- |
+| `plugin` / `theme` | Zip の一番上のフォルダー名。管理画面からアップロードすると、WordPress はこの名前のフォルダーに置きます | 既存のものを置き換えず、**別のプラグイン・テーマとして入ります**(同じものが 2 つになり、有効化し直しが要ります) |
+| `dir` | Zip の一番上のフォルダー名と、表示する SSH の手順で置き換える場所(`$DOCROOT/<slug>`) | 手順のとおりに実行すると、**別の名前(別の URL)に置かれ**、元のディレクトリの旧版は退避されません。手順の `mv` の行き先を、毎回手で直すことになります |
+
+- スラッグを省くと、ディレクトリ名がそのまま使われます。ふつうは省いてください
+- 書く必要があるのは、パスが `.` のとき(プラグイン 1 つ型。ディレクトリ名が決まらない)だけです。そのときは、**サーバーで使っているフォルダー名**を書きます
+- ディレクトリ名に、スラッグに使えない文字(日本語・空白など)が入っているときは、スラッグを書けません。ディレクトリ名を英数字に変えることを勧めます
+- 根拠(`plugin` / `theme`): WordPress 7.1.3 の `wp-admin/includes/class-wp-upgrader.php` の `install_package()` は、置く先を「プラグイン(テーマ)のディレクトリ + Zip の一番上のフォルダー名(`basename( $source )`)」にします
 
 ## 動作の詳細
 
@@ -308,7 +325,7 @@ Zip を作った(作り直した)あとに、サーバーへ上げる手順を�
 KIND    SLUG        VERSION    TAG                 TAGGED PATH
 plugin  my-plugin   1.2.3      my-plugin/1.2.3     yes    wp-content/plugins/my-plugin
 theme   my-theme    0.1.0      my-theme/0.1.0      no     wp-content/themes/my-theme
-dir     landing     2.0.0      landing/2.0.0       no     lp
+dir     lp          2.0.0      lp/2.0.0            no     lp
 ```
 
 ディレクトリが無い・版を読めない対象は、`?` を付けて一覧に残します(終了コードは 0)。
@@ -319,12 +336,14 @@ dir     landing     2.0.0      landing/2.0.0       no     lp
 テストは bash だけで書いてあります(外部のテストツールは要りません)。
 
 ```bash
-tests/run.sh                 # すべて(shellcheck を含む. 約 1 分)
+tests/run.sh                 # すべて(shellcheck を含む. 約 5 分. Zip を実際に作るテストが大半)
 tests/run.sh preflight       # ファイル名に 'preflight' を含むケースだけ
 tests/run.sh zip rebuild     # そのファイルの中で、テスト名に 'rebuild' を含むものだけ
 tests/run.sh lint            # shellcheck だけ
 ```
 
+- **すべてのテストには、約 5 分かかります**(2026-10-28 の実測で 4 分 42 秒)。そのうち 93% は、実物の `wp dist-archive` で Zip を作る `40_zip`(75 秒)・`50_tag_rebuild`(116 秒)・`60_deploy_hint`(70 秒)です。
+  残りの lint・`10_cli`・`20_config`・`30_preflight` は、合わせて約 20 秒です。WP-CLI の起動(1 回 0.15 秒)と、タグに道具の版を記録するための `wp package list`(1 回 1.5 秒)を、Zip を作るたびに呼ぶためです
 - ケースは `tests/cases/` にあります(`10_cli`・`20_config`・`30_preflight`・`40_zip`・`50_tag_rebuild`・`60_deploy_hint`)。共通部品は `tests/lib.sh` です
 - テストは一時ディレクトリの中だけで動きます。Git の設定(`GIT_CONFIG_GLOBAL`)と `TMPDIR` をテスト用に差し替えるので、実行する人の環境に結果が左右されません
 - 必要なもの: git 2.32 以上・unzip。**Zip を実際に作るテストは、実物の `wp dist-archive` と zip が無ければ SKIP になります**
