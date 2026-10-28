@@ -184,7 +184,14 @@ have_dist_archive() {
 }
 
 # 実物の wp dist-archive が無ければ、そのテストを飛ばす(SKIP にする). 使い方(テストの先頭): need_real_wp || return 0
+# run.sh を --all なしで流したとき(WRZM_QUICK=1)も飛ばす. 全部を流すと約 5 分かかるため(時間の大半が、これらのテスト).
+# 飛ばしたテストの名前を WRZM_QUICK_LOG に書き、run.sh が最後に件数を数えて表示する.
 need_real_wp() {
+	if [ "${WRZM_QUICK:-0}" = "1" ]; then
+		skip "実物の WP-CLI が要る. すべてを流すなら tests/run.sh --all"
+		[ -z "${WRZM_QUICK_LOG:-}" ] || printf '%s\n' "${CUR_NAME}" >>"${WRZM_QUICK_LOG}"
+		return 1
+	fi
 	if have_dist_archive; then
 		return 0
 	fi
