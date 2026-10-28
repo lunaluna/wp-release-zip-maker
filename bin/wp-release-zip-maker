@@ -978,6 +978,7 @@ tag_recorded_text() {
 # 調べられなければ 'unknown'(記録のために Zip の作成を止めはしない). どれも標準出力へ版だけを出す.
 # 取り方は、この Mac での実測による(2026-10-26): wp --version = 'WP-CLI 2.12.0'・
 #   wp package list --fields=name,version --format=csv の行 = 'wp-cli/dist-archive-command,v3.1.0'・zip -v の 2 行目 = 'This is Zip 3.0 (...)'.
+#   dist-archive は、2026-10-28 から先に installed.json を読む(dist_archive_version の説明).
 # Composer の Deprecated 警告(Mac の PHP 8.4 + WP-CLI 2.12.0)は、取り除く. stdin を閉じるのは、万一待たれても止まらないようにするため.
 
 wp_cli_version() {
@@ -986,9 +987,44 @@ wp_cli_version() {
 	printf '%s' "${v:-unknown}"
 }
 
+# Composer の installed.json($1)から、パッケージ($2)の "version" の値を標準出力へ出す. 見つからなければ何も出さない.
+# jq に頼らず、Composer が書く整形された形(1 行に 1 つのキー. "name" の直後に "version")を前提に、行で読む.
+# Composer 2 の {"packages": [...]} と Composer 1 の [...] のどちらでも、パッケージの中の並びは同じ.
+# "name" の行の後、次のパッケージの "name" より先に "version" が無ければ、何も出さない(別のパッケージの版を拾わないため).
+# 1 行にまとめられた JSON など、前提と違う形なら何も出さず、呼び出し側が wp package list で読み直す.
+installed_json_version() {
+	LC_ALL=C awk -v pkg="$2" '
+		!found && index($0, "\"name\"") && index($0, "\"" pkg "\"") { found = 1; next }
+		found && /"name"[[:space:]]*:/ { exit }
+		found && /"version"[[:space:]]*:/ {
+			sub(/^[^:]*:[[:space:]]*"/, "")
+			sub(/".*$/, "")
+			print
+			exit
+		}
+	' "$1" 2>/dev/null
+}
+
+# dist-archive の版. まず WP-CLI のパッケージの置き場所の installed.json から読み、読めなければ wp package list で読む.
+# 理由: wp package list は Composer を読み込むので 1 回 1.5〜1.7 秒かかり(2026-10-28 の実測)、Zip を作るたびの待ちと、
+#   テストの時間の半分以上を占めていた. wp package path は 0.38 秒(同じ日の実測).
+# 同じ値になる根拠(WP-CLI 2.12.0 の phar の中のソースで確認): wp package list は、Composer のローカルのリポジトリ
+#   (Composer の Factory.php で vendor/composer/installed.json)の各パッケージの getPrettyVersion()(= "version" の値)を出す.
+# 版の先頭の 'v' は取る(タグの記録は今までどおり '3.1.0' の形).
+# 状態ごとの動き: package path が失敗・installed.json が無い・パッケージの行が無い・版の形でない → wp package list で読む.
+#   それも読めなければ 'unknown'.
 dist_archive_version() {
-	local v
-	v="$("${WP_BIN}" package list --fields=name,version --format=csv 2>/dev/null </dev/null | sed -n 's#^wp-cli/dist-archive-command,v\{0,1\}##p' | head -n 1 | tr -d '\r')"
+	local v="" dir
+	dir="$("${WP_BIN}" package path 2>/dev/null </dev/null | grep -v -i 'deprecated' | head -n 1 | tr -d '\r')"
+	if [ -n "${dir}" ] && [ -f "${dir%/}/vendor/composer/installed.json" ]; then
+		v="$(installed_json_version "${dir%/}/vendor/composer/installed.json" wp-cli/dist-archive-command)"
+		v="${v#v}"
+		# 版の形(英数字で始まり、英数字・. _ + - だけ)でなければ使わない. タグのメッセージに妙な文字を入れないため.
+		valid_version "${v}" || v=""
+	fi
+	if [ -z "${v}" ]; then
+		v="$("${WP_BIN}" package list --fields=name,version --format=csv 2>/dev/null </dev/null | sed -n 's#^wp-cli/dist-archive-command,v\{0,1\}##p' | head -n 1 | tr -d '\r')"
+	fi
 	printf '%s' "${v:-unknown}"
 }
 

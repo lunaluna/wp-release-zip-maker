@@ -308,6 +308,55 @@ test_tag_records_the_tool_versions() {
 	assert_eq "${wp_v}" "$(tag_field "${tag}" "WP-CLI")" "記録された WP-CLI の版"
 	assert_eq "${zip_v}" "$(tag_field "${tag}" "zip")" "記録された zip の版"
 	printf '%s' "$(tag_field "${tag}" "dist-archive")" | grep -qE '^[0-9]+\.[0-9]+' || fail "dist-archive の版が記録されていません: $(tag_field "${tag}" "dist-archive")"
+	# ツールは installed.json から読む(速い). 以前の読み方(wp package list)と同じ値になること.
+	local list_v
+	list_v="$(wp package list --fields=name,version --format=csv 2>/dev/null | sed -n 's#^wp-cli/dist-archive-command,v\{0,1\}##p' | head -n 1)"
+	[ -z "${list_v}" ] || assert_eq "${list_v}" "$(tag_field "${tag}" "dist-archive")" "wp package list と同じ dist-archive の版"
+}
+
+# dist-archive の版の読み方(組み合わせ表の各行). installed.json から読めればそれを、読めなければ wp package list の値を記録する.
+# 偽の wp: dist-archive と --version は本物に渡し、package path は場面ごとの動き、package list は 'v1.1.1' を返す.
+test_dist_archive_version_sources() {
+	need_real_wp || return 0
+	local real case_name pkgdir path_code expect fake n=0
+	real="$(command -v wp)"
+	for case_name in composer2 composer1 no_entry no_json path_fails no_version_in_entry; do
+		n=$((n + 1))
+		pkgdir="${TEST_ROOT}/pkgdir-${case_name}"
+		mkdir -p "${pkgdir}/vendor/composer"
+		path_code="echo '${pkgdir}/'"
+		expect="1.1.1"
+		case "${case_name}" in
+			composer2)
+				# Composer 2 の形({"packages": [...]}). 先頭の v は取る.
+				printf '{\n    "packages": [\n        {\n            "name": "other/pkg",\n            "version": "5.5.5"\n        },\n        {\n            "name": "wp-cli/dist-archive-command",\n            "version": "v9.8.7",\n            "version_normalized": "9.8.7.0"\n        }\n    ]\n}\n' >"${pkgdir}/vendor/composer/installed.json"
+				expect="9.8.7"
+				;;
+			composer1)
+				# Composer 1 の形(配列). 版に v が無い場合.
+				printf '[\n    {\n        "name": "wp-cli/dist-archive-command",\n        "version": "9.8.6"\n    }\n]\n' >"${pkgdir}/vendor/composer/installed.json"
+				expect="9.8.6"
+				;;
+			no_entry)
+				printf '{\n    "packages": [\n        {\n            "name": "other/pkg",\n            "version": "5.5.5"\n        }\n    ]\n}\n' >"${pkgdir}/vendor/composer/installed.json"
+				;;
+			no_json) ;;
+			path_fails) path_code="exit 1" ;;
+			no_version_in_entry)
+				# dist-archive の中に version が無い. 次のパッケージの版(5.5.5)を拾わないこと.
+				printf '{\n    "packages": [\n        {\n            "name": "wp-cli/dist-archive-command"\n        },\n        {\n            "name": "other/pkg",\n            "version": "5.5.5"\n        }\n    ]\n}\n' >"${pkgdir}/vendor/composer/installed.json"
+				;;
+		esac
+		fake="$(make_fake_wp "dav-${case_name}" "case \"\$1\" in dist-archive | --version) exec '${real}' \"\$@\" ;; esac
+if [ \"\$1\" = package ] && [ \"\$2\" = path ]; then ${path_code}; exit 0; fi
+if [ \"\$1\" = package ] && [ \"\$2\" = list ]; then printf 'name,version\nwp-cli/dist-archive-command,v1.1.1\n'; exit 0; fi
+exit 1")"
+		mk_docroot "dav${n}"
+		LABEL="${case_name}"
+		run_tool_env "WP_RELEASE_ZIP_MAKER_WP=${fake}" -- my-plugin
+		assert_rc 0
+		assert_eq "${expect}" "$(tag_field my-plugin/1.2.3 "dist-archive")" "記録された dist-archive の版"
+	done
 }
 
 # 版を調べられないときは、unknown と記録して、Zip の作成は続ける(版の記録のために止めない).
