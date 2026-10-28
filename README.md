@@ -83,6 +83,7 @@ wp-release-zip-maker --version      # 版が出れば、PATH が通っていま�
 wp-release-zip-maker <slug>                    # HEAD から Zip を作り、注釈付きタグを打つ(push はしない)
 wp-release-zip-maker <slug> --sign             # 署名付きのタグ(git tag -s)を打つ(gpg と鍵が要る)
 wp-release-zip-maker <slug> --dry-run          # 確認だけ(Zip もタグも作らない)
+wp-release-zip-maker <slug> [--rebuild [<版>]] --dry-run --verify-content   # Zip を一時ディレクトリに作って中身まで確かめ、消す
 wp-release-zip-maker <slug> --rebuild [<版>]   # 既存のタグの時点から Zip だけを作り直す(タグは打たない)
 wp-release-zip-maker <slug> --rebuild [<版>] --allow-content-change   # 内容の指紋がタグの記録と違っても続ける
 wp-release-zip-maker <slug> [--rebuild [<版>]] --manifest             # Zip のファイルごとの SHA-256 の一覧も作る
@@ -162,6 +163,18 @@ check    wp-content/plugins/my-plugin/package.json:"version"
 - 目安にする値は、実際の Zip から決めてください(2026-10-28 に測った例: プラグイン 170KB・72 ファイル・展開後 440KB / テーマ 424KB・107 ファイル・展開後 660KB / 画像の多いディレクトリ 3.5MB・30 ファイル・展開後 3.8MB)。上の例の値は書き方の見本です
 - 展開後の大きさは `unzip -Zt` の「N bytes uncompressed」から読みます(読めなければ `unzip -l` の合計の行)。書式は Info-ZIP の版で違う可能性があり、この Mac の `unzip` 6.00 でだけ確かめました。読めなければ、`max_uncompressed_bytes` を確かめられないので止めます
 - **1.1.0 以前のツールは、知らないキーで止まります。** 使うなら `requires = 1.2.0` にしてください
+
+### 中身まで確かめる(`--dry-run --verify-content`)
+
+`--dry-run` は、Zip を作らずに事前の確認だけをするので、**中身の検査(配布してはいけないファイル・外へ出る名前)と大きさの上限は、実際に作るまで分かりません**。
+`--verify-content` を `--dry-run` に付けると、事前の確認がすべて通ったあと、一時ディレクトリに Zip を作り、本番と同じ確認をします。
+
+- 確かめるもの: 中身の検査(`verify_zip`)・大きさの上限・ASCII 以外のファイル名の警告。そのあと、サマリー(大きさ・SHA-256・直下の内訳)を出して、**Zip を消します**
+- **出力先・タグ・マニフェストには何も作りません**(出力先のディレクトリも作りません)。一時ディレクトリも残しません
+- `--rebuild --dry-run --verify-content` では、タグに記録された内容の指紋との比較も表示します。違っても止めません(確認だけなので。本番の `--rebuild` は、違えば止まります)
+- 確認に落ちたときは、本番と同じメッセージで止まります(終了コード 1)
+- 実物の `wp dist-archive` が要ります(事前の確認で、無ければ止まります)。Zip を作るぶん、`--dry-run` だけより時間がかかります
+- `--dry-run` と一緒のときだけ使えます(単独・`--list` と一緒は、使い方の誤りで終了コード 2)
 
 ### 事前の確認(`<slug> --dry-run`)
 

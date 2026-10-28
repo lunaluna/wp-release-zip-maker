@@ -290,6 +290,53 @@ test_manifest_lists_every_file_with_its_sha256() {
 	(cd "${x}" && shasum -a 256 -c "${mf}" >/dev/null 2>&1) && fail "改ざんしたのに、照合が通りました"
 }
 
+# --dry-run --verify-content: 一時ディレクトリに Zip を作って本番と同じ確認をし、サマリーを出して消す.
+# 出力先(ディレクトリごと)・タグ・マニフェストには何も作らず、一時ディレクトリも残さない.
+test_verify_content_builds_checks_and_leaves_nothing() {
+	need_real_wp || return 0
+	mk_docroot vc1
+	run_tool my-plugin --dry-run --verify-content --manifest
+	assert_rc 0
+	assert_has "[dry-run] Zip もタグも作りません"
+	assert_has "--verify-content:"
+	assert_has "SHA-256:"
+	assert_has "my-plugin/ の直下"
+	assert_has "中身の確認はすべて通りました"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+	LABEL="付けなければ Zip を作らない"
+	run_tool my-plugin --dry-run
+	assert_rc 0
+	assert_lacks "--verify-content:"
+}
+
+# 本番と同じ確認に落ちたら、止まる(配布してはいけないファイル・大きさの上限). 何も作らない.
+test_verify_content_stops_on_the_same_checks_as_the_real_run() {
+	need_real_wp || return 0
+	mk_docroot vc2
+	commit_forbidden_files "${FORBIDDEN_FILES}"
+	LABEL="配布してはいけないファイル"
+	run_tool my-plugin --dry-run --verify-content
+	assert_rc 1
+	assert_has "配布してはいけないファイル"
+	assert_lacks "中身の確認はすべて通りました"
+	assert_no_file "${OUTD}"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+	mk_docroot vc3
+	set_config "output = ${OUTD}
+max_files = 1
+plugin ${P}"
+	LABEL="大きさの上限"
+	run_tool my-plugin --dry-run --verify-content
+	assert_rc 1
+	assert_has "max_files: ファイルの数"
+	assert_no_file "${OUTD}"
+	LABEL="--dry-run だけなら、上限は確かめない(Zip を作らないため)"
+	run_tool my-plugin --dry-run
+	assert_rc 0
+}
+
 # 大きさの上限(max_zip_bytes・max_files・max_uncompressed_bytes): 超えたら止める. 出力先に Zip を置かず、タグも打たない.
 # 超えた項目と値・大きいファイルの上位 10 個・直下の内訳を出す. 上限以下なら進み、サマリーに「上限:」を出す.
 test_size_limits_stop_when_exceeded() {

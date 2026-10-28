@@ -75,6 +75,9 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
       署名付きのタグ(git tag -s)を打つ. gpg と鍵が要る. 署名できなければ、タグも Zip も作らない
   ${PROG} <slug> --dry-run
       確認だけ(Zip もタグも作らない)
+  ${PROG} <slug> [--rebuild [<版>]] --dry-run --verify-content
+      確認のあと、一時ディレクトリに Zip を作り、本番と同じ中身の確認(検査・大きさの上限・名前の警告)をして、
+      サマリーを出して Zip を消す. 出力先・タグ・マニフェストには何も作らない. --dry-run のときだけ指定できる
   ${PROG} <slug> [--rebuild [<版>]] --manifest
       Zip のファイルごとの SHA-256 の一覧(<slug>.<版>.manifest.txt)も、出力先に作る
   ${PROG} <slug> --rebuild [<版>]
@@ -685,6 +688,8 @@ TMP_WORK=""
 # make_zip が、作った Zip を 1 回だけ展開して走査した結果(zip_scan の行)を書くファイル. TMP_WORK の中にある.
 # 内容の指紋(タグ・--rebuild の比較)とマニフェストは、このファイルを読む(同じ走査の結果なので食い違わず、展開も 1 回で済む).
 ZIP_SCAN_FILE=""
+# make_zip が作った Zip の、一時ディレクトリの中のパス(置く前の Zip. --verify-content は、これを表示して消す).
+BUILT_ZIP=""
 # 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
 PART_FILE=""
 
@@ -799,11 +804,13 @@ human_size() {
 
 # Git の ref($3)の時点の対象ディレクトリから Zip を作る. 作業ツリーは使わない(未追跡・無視されたファイルは入らない).
 #   $1 = スラッグ / $2 = 対象のパス(設定ファイルからの相対) / $3 = ref(コミットのハッシュ) / $4 = 出力する Zip のパス / $5 = 種類(plugin・theme・dir)
+#   $6 = 1(既定)なら、確認のあと出力先へ置く(publish_zip). 0 なら置かない(--dry-run --verify-content). 置かないときも、確認はすべて同じに行う.
+# 作った Zip(確認のあと・置く前)は BUILT_ZIP に入る. 置かなければ、その Zip は TMP_WORK の中にだけあり、終了時に消える.
 # 手順: git archive で一時ディレクトリ/<スラッグ>/ へ展開 → wp dist-archive(.distignore を適用して zip) → 中身の確認.
 # 一時ディレクトリの名前を実パスにするのは、シンボリックリンクを含むと dist-archive が別の経路(コピー)に入るため.
 # 一時ディレクトリの下をスラッグと同じ名前にするのは、Zip の一番上のフォルダー名をスラッグにするため.
 make_zip() {
-	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5"
+	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5" place="${6:-1}"
 	local tree_path dest st wp_out wp_rc built
 
 	# リポジトリのルートから見た対象のパス(git archive の <ref>:<パス> に使う). PREFIX は cmd_build が埋める.
@@ -850,7 +857,8 @@ ${wp_out}"
 	# 置く前(publish_zip の前)に行うので、展開できなければ、最終のパスに Zip を残さずに止まる.
 	ZIP_SCAN_FILE="${TMP_WORK}/scan.txt"
 	zip_scan "${built}" >"${ZIP_SCAN_FILE}" || die "Zip を展開できず、中身を走査できませんでした(内容の指紋を作れないので、Zip は作りません)."
-	publish_zip "${built}" "${zip_file}"
+	BUILT_ZIP="${built}"
+	[ "${place}" -eq 0 ] || publish_zip "${built}" "${zip_file}"
 }
 
 # 作ったファイル($1)を、最終のパス($2)へ、上書きせずに置く. すでに何かあれば(壊れたシンボリックリンクも)、置かずに止める.
@@ -1229,10 +1237,27 @@ read_version_at() {
 
 # --- build / --dry-run / --rebuild --------------------------------------------------------------
 
+# --dry-run --verify-content: Zip を一時ディレクトリに作り、本番と同じ確認(make_zip の中の検査・大きさの上限・名前の警告)をして、
+# サマリーを出し、Zip を消す. 出力先・タグ・マニフェストには何も作らない(make_zip に、置かないと伝える).
+# --rebuild のときは、タグの記録の指紋との比較も出す(確認だけなので、違っても止めない).
+# 確認に落ちたときは、本番と同じメッセージで止まる(終了コード 1). 一時ディレクトリは、終了時に cleanup_tmp が消す.
+#   $1 = スラッグ / $2 = 対象のパス / $3 = ref / $4 = 本番なら置く Zip のパス(名前の元) / $5 = 種類 / $6 = 1 なら --rebuild / $7 = タグ名
+verify_content_run() {
+	local slug="$1" path="$2" ref="$3" zip_file="$4" kind="$5" rebuild="$6" tag="$7"
+	printf '\n--- --verify-content: Zip を一時ディレクトリに作り、中身まで確かめます(出力先・タグ・マニフェストには何も作りません)---\n'
+	make_zip "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}" 0
+	printf '\n'
+	print_zip_summary "${slug}" "${BUILT_ZIP}"
+	[ "${rebuild}" -eq 0 ] || check_rebuild_digest "${tag}" "${BUILT_ZIP}" 0 1
+	rm -f -- "${BUILT_ZIP}"
+	printf '\n[verify-content] 中身の確認はすべて通りました. 確認用の Zip は消しました(出力先には何も作っていません).\n'
+}
+
 # 3 つの動作の事前の確認と実行.
 #   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
 #   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
 #   $7 = 1 なら、署名付きのタグを打つ(--sign. 通常の実行だけ)
+#   $8 = 1 なら、--dry-run のあと Zip を一時ディレクトリに作って中身まで確かめ、消す(--verify-content. --dry-run のときだけ)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1240,7 +1265,7 @@ read_version_at() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" manifest_file=""
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1393,6 +1418,7 @@ cmd_build() {
 		printf 'Zip:        %s\n' "${zip_file}"
 		[ "${manifest}" -eq 0 ] || printf 'マニフェスト: %s\n' "${manifest_file}"
 		[ "${sign}" -eq 0 ] || printf '署名:       する(git tag -s. gpg と鍵が要ります. 署名できなければ、タグも Zip も作りません)\n'
+		[ "${verify_content}" -eq 0 ] || verify_content_run "${slug}" "${path}" "${ref}" "${zip_file}" "${kind}" "${rebuild}" "${tag}"
 		return 0
 	fi
 
@@ -1465,8 +1491,9 @@ print_tool_version_comparison() {
 #             警告だけで手順の表示まで進むと、そのままアップロードされてしまう(2026-10-26 のレビュー). 意図した差なら --allow-content-change で続ける.
 # 止めないとき: 指紋が一致・タグに記録がない(古いタグ・軽量タグ)・指紋を計算できない(Zip を展開できない)は、比べようがないので警告だけ.
 #   $1 = タグ名 / $2 = 作り直した Zip のパス / $3 = 1 なら、不一致でも続ける(--allow-content-change)
+#   $4 = 1 なら、確認だけ(--dry-run --verify-content). 不一致でも止めない(Zip は一時ディレクトリのもので、どのみち消える)
 check_rebuild_digest() {
-	local tag="$1" zip_file="$2" allow="$3" now recorded mismatch=0
+	local tag="$1" zip_file="$2" allow="$3" verify_only="${4:-0}" now recorded mismatch=0
 	recorded="$(tag_recorded_field "${tag}" "Content-SHA-256")"
 	now="$(zip_content_digest)" || now=""
 	printf '\nタグとの比較:\n'
@@ -1488,6 +1515,10 @@ check_rebuild_digest() {
 		printf '  (Zip 全体の SHA-256 は、作り直すたびに変わります. 配布した Zip の現物は、タグに記録された SHA-256 と照合してください: %s)\n' "${recorded}"
 	fi
 	[ "${mismatch}" -eq 1 ] || return 0
+	if [ "${verify_only}" -eq 1 ]; then
+		printf '  --verify-content は確認だけなので、止めません(本番の --rebuild では、--allow-content-change が無ければ止まります).\n'
+		return 0
+	fi
 	if [ "${allow}" -eq 1 ]; then
 		printf '  --allow-content-change が指定されているので続行します.\n'
 		return 0
@@ -1648,7 +1679,7 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 verify_content=0
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
@@ -1657,6 +1688,7 @@ main() {
 			--allow-content-change) allow_change=1 ;;
 			--manifest) manifest=1 ;;
 			--sign) sign=1 ;;
+			--verify-content) verify_content=1 ;;
 			-*)
 				err "${PROG}: 不明なオプション '$1'"
 				err "'${PROG} --help' で使い方を確認してください."
@@ -1678,7 +1710,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${verify_content}" -eq 1 ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1708,7 +1740,13 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}"
+	# --verify-content は、--dry-run の確認を、Zip を作るところまで広げるもの. --dry-run が無ければ、本番の実行が Zip を作るので意味がない.
+	if [ "${verify_content}" -eq 1 ] && [ "${dry}" -eq 0 ]; then
+		err "${PROG}: --verify-content は --dry-run と一緒にだけ指定できます(Zip を一時ディレクトリに作って中身まで確かめ、消すためのものです)."
+		exit "${EXIT_USAGE}"
+	fi
+
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}"
 }
 
 main "$@"

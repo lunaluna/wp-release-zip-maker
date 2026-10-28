@@ -216,6 +216,30 @@ test_rebuild_allows_a_fingerprint_mismatch_when_told_to() {
 	assert_file "${OUTD}/my-plugin.1.2.3.zip"
 }
 
+# --rebuild --dry-run --verify-content: タグの記録との比較も出す. 一致なら一致と言い、違っても止めない(確認だけ).
+# どちらでも、出力先に Zip を作らず、タグも変えない.
+test_verify_content_with_rebuild_compares_with_the_tag() {
+	need_real_wp || return 0
+	mk_docroot vc4
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	LABEL="一致"
+	run_tool my-plugin --rebuild --dry-run --verify-content
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と一致しました"
+	assert_has "中身の確認はすべて通りました"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	retag_with_fingerprint "$(printf '%064d' 1)"
+	LABEL="不一致でも止めない"
+	run_tool my-plugin --rebuild --dry-run --verify-content
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と違います"
+	assert_has "--verify-content は確認だけなので、止めません"
+	assert_lacks "--allow-content-change が指定されているので続行します"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+}
+
 test_allow_content_change_needs_rebuild() {
 	need_real_wp || return 0
 	mk_docroot r5c
