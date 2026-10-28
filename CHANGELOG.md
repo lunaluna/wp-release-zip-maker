@@ -13,6 +13,7 @@
 
 ### Changed
 
+- タグに記録する dist-archive の版を、まず WP-CLI のパッケージの置き場所(`wp package path`)の `vendor/composer/installed.json` から読む. 読めなければ、これまでどおり `wp package list` で読む(それも読めなければ `unknown`). `wp package list` は 1 回 1.5〜1.7 秒かかり、Zip を作るたびの待ちになっていた(`wp package path` は 0.13〜0.38 秒. 2026-10-28 の実測). 記録する値は同じ(`wp package list` も `installed.json` の `version` を出す. WP-CLI 2.12.0 のソースで確認). テストの `50_tag_rebuild` は 117 秒から 61 秒になった
 - テスト(`tests/run.sh`): 引数なしでは、実物の WP-CLI が要るテスト(67 件)を飛ばし、速いテストだけを流す(約 30 秒). 絞り込みを付けても同じで、すべてを流すには `--all` を付ける. 最後に、飛ばした件数と `--all` の案内を必ず表示する. `tests/cases/*.sh` を直接実行したときは、これまでどおりすべてを流す
 - テスト(`tests/lib.sh`): 実物の `wp dist-archive` があるかを、テストごとではなく、ファイルごとに 1 回だけ調べる(`wp dist-archive --help` の呼び出しが 67 回から 3 回に減る)
 
