@@ -42,6 +42,10 @@ GIT_TOP=""      # Git のルート(シンボリックリンクを解いた絶対
 CFG_TAG_FORMAT=""
 CFG_OUTPUT=""
 CFG_REQUIRES=""
+# 大きさの上限(省略可. 空 = 確かめない). 値はバイト数・ファイル数の整数(K・M・G は読み込み時に掛けて整数にする).
+CFG_MAX_ZIP_BYTES=""          # Zip のファイルの大きさ
+CFG_MAX_FILES=""              # Zip の中のファイルの数(ディレクトリは数えない)
+CFG_MAX_UNCOMPRESSED_BYTES="" # 展開したときの合計の大きさ
 
 # --- 表示まわり ---------------------------------------------------------------------------------
 
@@ -215,7 +219,7 @@ load_config() {
 	find_config
 
 	local line lineno=0 first rest value kind path slug extra
-	local seen_tag_format=0 seen_output=0 seen_requires=0
+	local seen_tag_format=0 seen_output=0 seen_requires=0 seen_limits=' '
 
 	while IFS= read -r line || [ -n "${line}" ]; do
 		lineno=$((lineno + 1))
@@ -232,7 +236,7 @@ load_config() {
 		rest="$(trim "${line#"${first}"}")"
 
 		case "${first}" in
-			tag_format | output | requires)
+			tag_format | output | requires | max_zip_bytes | max_files | max_uncompressed_bytes)
 				case "${rest}" in
 					=*) value="$(trim "${rest#=}")" ;;
 					*) die "${CONFIG_NAME}:${lineno}: '${first} = 値' の形で書いてください." ;;
@@ -253,6 +257,20 @@ load_config() {
 						[ "${seen_requires}" -eq 0 ] || die "${CONFIG_NAME}:${lineno}: requires が 2 回書かれています."
 						seen_requires=1
 						CFG_REQUIRES="${value}"
+						;;
+					max_zip_bytes | max_files | max_uncompressed_bytes)
+						case "${seen_limits}" in
+							*" ${first} "*) die "${CONFIG_NAME}:${lineno}: ${first} が 2 回書かれています." ;;
+						esac
+						seen_limits="${seen_limits}${first} "
+						# 大きさの上限は 1 つの設定ファイルに 1 つ(対象ごとには持たない). 値は正の整数で、末尾に K・M・G を付けてもよい.
+						value="$(parse_limit "${value}")" ||
+							die "${CONFIG_NAME}:${lineno}: ${first} は、正の整数で書いてください(末尾に K・M・G を付けてもよい. 例: 20M). '$(trim "${rest#=}")' は読めません."
+						case "${first}" in
+							max_zip_bytes) CFG_MAX_ZIP_BYTES="${value}" ;;
+							max_files) CFG_MAX_FILES="${value}" ;;
+							max_uncompressed_bytes) CFG_MAX_UNCOMPRESSED_BYTES="${value}" ;;
+						esac
 						;;
 				esac
 				;;
@@ -298,6 +316,26 @@ load_config() {
 	done <"${CONFIG_FILE}"
 
 	validate_config
+}
+
+# 上限の値("20M"・"500"・"1G" など)を整数にして標準出力へ出す. 書けるのは正の整数と、末尾の K・M・G(1024 の倍数. 小文字も可).
+# 読めなければ何も出さず 1 を返す. 桁は 12 桁まで(bash の整数の範囲に収まり、G を掛けても溢れない).
+parse_limit() {
+	local v="$1" num mult=1
+	case "${v}" in
+		*[Kk]) mult=1024; num="${v%?}" ;;
+		*[Mm]) mult=1048576; num="${v%?}" ;;
+		*[Gg]) mult=1073741824; num="${v%?}" ;;
+		*) num="${v}" ;;
+	esac
+	case "${num}" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+	[ "${#num}" -le 12 ] || return 1
+	# 先頭の 0 を 8 進数と読ませない(10# を付ける).
+	num=$((10#${num}))
+	[ "${num}" -gt 0 ] || return 1
+	printf '%s' "$((num * mult))"
 }
 
 # 読み込んだ設定の全体としての整合を確かめる(行ごとの形式は load_config で確かめ済み).
@@ -806,6 +844,8 @@ ${wp_out}"
 
 	verify_zip "${slug}" "${built}" "${kind}"
 	warn_non_ascii_names "${dest}"
+	# 大きさの上限(書いてあれば). 超えていれば、ここで止まる(出力先には何も置かない).
+	check_zip_limits "${slug}" "${built}"
 	# 中身の走査(展開とハッシュ)は、ここで 1 回だけ行う. 以降の指紋・マニフェストはこの結果を読む.
 	# 置く前(publish_zip の前)に行うので、展開できなければ、最終のパスに Zip を残さずに止まる.
 	ZIP_SCAN_FILE="${TMP_WORK}/scan.txt"
@@ -950,7 +990,71 @@ scan_zip_names() {
 		}'
 }
 
-# 作った Zip の要約を出す(ファイル数・サイズ・SHA-256・一番上のフォルダーの直下の内訳).
+# 大きさの上限を書いているときだけ、「上限: 〜 以下」の行を出す(確かめたあとの要約に付く. 超えていれば、ここへ来る前に止まっている).
+print_limits_line() {
+	local parts=""
+	[ -z "${CFG_MAX_ZIP_BYTES}" ] || parts="${parts:+${parts}・}Zip ${CFG_MAX_ZIP_BYTES} バイト"
+	[ -z "${CFG_MAX_FILES}" ] || parts="${parts:+${parts}・}ファイル ${CFG_MAX_FILES} 個"
+	[ -z "${CFG_MAX_UNCOMPRESSED_BYTES}" ] || parts="${parts:+${parts}・}展開後 ${CFG_MAX_UNCOMPRESSED_BYTES} バイト"
+	[ -z "${parts}" ] || printf '上限:       %s 以下(%s の設定)\n' "${parts}" "${CONFIG_NAME}"
+}
+
+# Zip の中の、通常のファイルの数(ディレクトリのエントリは数えない). $1 = Zip のパス
+zip_file_count() {
+	unzip -Z1 "$1" | LC_ALL=C awk '$0 !~ /\/$/ { n++ } END { print n + 0 }'
+}
+
+# Zip を展開したときの合計のバイト数. unzip -Zt の "N bytes uncompressed" から読む. 読めなければ unzip -l の合計の行で読む. どちらも読めなければ 1 を返す.
+# 書式は Info-ZIP の版で違う可能性がある(この Mac の unzip 6.00 で確かめた. 他の版は未確認).
+zip_uncompressed_bytes() {
+	local n
+	n="$(unzip -Zt "$1" | sed -n 's/.*[^0-9]\([0-9][0-9]*\) bytes uncompressed.*/\1/p' | head -n 1)"
+	if [ -z "${n}" ]; then
+		n="$(unzip -l "$1" | tail -n 1 | awk '{ print $1 }')"
+	fi
+	case "${n}" in
+		'' | *[!0-9]*) return 1 ;;
+	esac
+	printf '%s' "${n}"
+}
+
+# 大きさの上限を確かめる. 書いてある項目だけ確かめる(どれも書いていなければ何もしない).
+# 超えたら、超えた項目と値・大きいファイルの上位 10 個(展開後の大きさ順)・直下の内訳を出して、終了コード 1 で止める.
+# 呼ぶのは make_zip の中(最終のパスへ置く前)なので、止まっても出力先に Zip は残らない(一時ディレクトリの Zip は、終了時に消える).
+#   $1 = スラッグ / $2 = 確かめる Zip のパス
+check_zip_limits() {
+	local slug="$1" zip_file="$2" bytes files unc over=""
+	[ -n "${CFG_MAX_ZIP_BYTES}${CFG_MAX_FILES}${CFG_MAX_UNCOMPRESSED_BYTES}" ] || return 0
+	bytes="$(wc -c <"${zip_file}")"
+	bytes=$((bytes))
+	files="$(zip_file_count "${zip_file}")"
+	if [ -n "${CFG_MAX_UNCOMPRESSED_BYTES}" ]; then
+		unc="$(zip_uncompressed_bytes "${zip_file}")" ||
+			die "Zip の展開後の大きさを読めませんでした(max_uncompressed_bytes を確かめられないので、止めます)."
+	fi
+	if [ -n "${CFG_MAX_ZIP_BYTES}" ] && [ "${bytes}" -gt "${CFG_MAX_ZIP_BYTES}" ]; then
+		over="${over}  max_zip_bytes: Zip の大きさ $(human_size "${bytes}")(${bytes} バイト)が、上限 $(human_size "${CFG_MAX_ZIP_BYTES}")(${CFG_MAX_ZIP_BYTES} バイト)を超えています"$'\n'
+	fi
+	if [ -n "${CFG_MAX_FILES}" ] && [ "${files}" -gt "${CFG_MAX_FILES}" ]; then
+		over="${over}  max_files: ファイルの数 ${files} 個が、上限 ${CFG_MAX_FILES} 個を超えています"$'\n'
+	fi
+	if [ -n "${CFG_MAX_UNCOMPRESSED_BYTES}" ] && [ "${unc}" -gt "${CFG_MAX_UNCOMPRESSED_BYTES}" ]; then
+		over="${over}  max_uncompressed_bytes: 展開後の合計 $(human_size "${unc}")(${unc} バイト)が、上限 $(human_size "${CFG_MAX_UNCOMPRESSED_BYTES}")(${CFG_MAX_UNCOMPRESSED_BYTES} バイト)を超えています"$'\n'
+	fi
+	[ -n "${over}" ] || return 0
+	err "${PROG}: Zip が、${CONFIG_NAME} に書かれた大きさの上限を超えています(Zip は出力先に置きません。タグも打ちません):"
+	printf '%s' "${over}" >&2
+	err ""
+	err "大きいファイルの上位 10 個(展開後の大きさ):"
+	# unzip -Zl の 1 行: 権限 版 OS 大きさ 種類 圧縮後 方式 日付 時刻 名前(名前は 10 番目から. 空白を含みうる). ディレクトリ(末尾 /)は除く.
+	unzip -Zl "${zip_file}" | LC_ALL=C awk '$1 ~ /^[-dlrwxsStT]{10}$/ && $0 !~ /\/$/ { sz = $4; sub(/^([^ ]+ +){9}/, ""); printf "%d\t%s\n", sz, $0 }' |
+		LC_ALL=C tr -c '[:print:]\t\n' '?' | LC_ALL=C sort -t "$(printf '\t')" -k1,1nr | head -n 10 |
+		LC_ALL=C awk -F'\t' '{ printf "  %12d バイト  %s\n", $1, $2 }' >&2
+	print_top_level_breakdown "${slug}" "${zip_file}" >&2
+	exit "${EXIT_STOP}"
+}
+
+# 作った Zip の要約を出す(ファイル数・サイズ・SHA-256・上限・一番上のフォルダーの直下の内訳).
 #   $1 = スラッグ / $2 = Zip のパス
 print_zip_summary() {
 	local slug="$1" zip_file="$2" bytes
@@ -960,6 +1064,13 @@ print_zip_summary() {
 	printf 'サイズ:     %s (%s バイト)\n' "$(human_size "${bytes}")" "${bytes}"
 	printf 'SHA-256:    %s\n' "$(sha256_of "${zip_file}")"
 	printf '中身:       %s\n' "$(unzip -Zt "${zip_file}" | sed 's/^[[:space:]]*//')"
+	print_limits_line
+	print_top_level_breakdown "${slug}" "${zip_file}"
+}
+
+# 一番上のフォルダーの直下の内訳(ファイル数 名前)を出す. $1 = スラッグ / $2 = Zip のパス
+print_top_level_breakdown() {
+	local slug="$1" zip_file="$2"
 	printf '\n%s/ の直下(ファイル数 名前):\n' "${slug}"
 	# 一番上のフォルダーの直下の名前ごとに、ファイル数を数える(末尾が '/' のディレクトリのエントリは数えない).
 	# LC_ALL=C: ASCII 以外のファイル名でも落ちないように. macOS の unzip は、ASCII 以外のバイトの一部を '?' に置き換え、

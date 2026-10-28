@@ -290,6 +290,109 @@ test_manifest_lists_every_file_with_its_sha256() {
 	(cd "${x}" && shasum -a 256 -c "${mf}" >/dev/null 2>&1) && fail "改ざんしたのに、照合が通りました"
 }
 
+# 大きさの上限(max_zip_bytes・max_files・max_uncompressed_bytes): 超えたら止める. 出力先に Zip を置かず、タグも打たない.
+# 超えた項目と値・大きいファイルの上位 10 個・直下の内訳を出す. 上限以下なら進み、サマリーに「上限:」を出す.
+test_size_limits_stop_when_exceeded() {
+	need_real_wp || return 0
+	local z key
+	for key in "max_zip_bytes = 1" "max_files = 1" "max_uncompressed_bytes = 1"; do
+		mk_docroot lim_"${key%% *}"
+		z="${OUTD}/my-plugin.1.2.3.zip"   # OUTD は mk_docroot ごとに変わる
+		LABEL="${key}"
+		set_config "output = ${OUTD}
+${key}
+plugin ${P}"
+		run_tool my-plugin
+		assert_rc 1
+		assert_has "大きさの上限を超えています"
+		assert_has "${key%% *}:"
+		assert_has "大きいファイルの上位 10 個"
+		assert_has "my-plugin/ の直下"
+		assert_no_file "${z}"
+		assert_eq "" "$(git tag)" "上限超えで打たれたタグ"
+		assert_eq "0" "$(leftover_tmp_count)" "取り残した一時ディレクトリ"
+	done
+}
+
+# 上限を超えた項目だけが表示に出ること(超えていない項目は出さない)・大きいファイルが大きさ順に並ぶこと.
+test_size_limit_report_lists_only_the_exceeded_items_and_orders_files() {
+	need_real_wp || return 0
+	mk_docroot lim_rep
+	head -c 5000 /dev/zero | tr '\0' 'a' > "${P}/big file.txt"   # 空白入りの名前. 一番大きいファイルにする
+	gcommit "big"
+	set_config "output = ${OUTD}
+max_files = 1
+max_zip_bytes = 20M
+plugin ${P}"
+	run_tool my-plugin
+	assert_rc 1
+	assert_has "max_files: ファイルの数"
+	assert_lacks "max_zip_bytes:"
+	# 上位の最初の行が、一番大きいファイル(5000 バイト).
+	local first
+	first="$(printf '%s\n' "${OUT}" | sed -n '/大きいファイルの上位 10 個/{n;p;}')"
+	case "${first}" in
+		*"5000 バイト  my-plugin/big file.txt") ;;
+		*) fail "最初の行が一番大きいファイルではありません: '${first}'" ;;
+	esac
+}
+
+test_size_limits_pass_and_show_in_the_summary() {
+	need_real_wp || return 0
+	mk_docroot lim_ok
+	set_config "output = ${OUTD}
+max_zip_bytes = 20M
+max_files = 1000
+max_uncompressed_bytes = 1G
+plugin ${P}"
+	run_tool my-plugin
+	assert_rc 0
+	assert_has "上限:       Zip 20971520 バイト・ファイル 1000 個・展開後 1073741824 バイト 以下"
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "1.2.3" "$(git tag | head -n 1)" "打たれたタグ(対象が 1 つなので {version})"
+}
+
+# ちょうど上限と同じ値は通る(超えたときだけ止める). ファイル数を実測して、その値を上限にする.
+test_size_limit_equal_to_the_value_passes() {
+	need_real_wp || return 0
+	mk_docroot lim_eq
+	run_tool my-plugin; assert_rc 0
+	local n
+	n="$(unzip -Z1 "${OUTD}/my-plugin.1.2.3.zip" | grep -vc '/$')"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	git tag -d 1.2.3 >/dev/null
+	LABEL="上限 = ファイル数(${n})"
+	set_config "output = ${OUTD}
+max_files = ${n}
+plugin ${P}"
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	git tag -d 1.2.3 >/dev/null
+	LABEL="上限 = ファイル数 - 1"
+	set_config "output = ${OUTD}
+max_files = $((n - 1))
+plugin ${P}"
+	run_tool my-plugin; assert_rc 1
+	assert_has "max_files: ファイルの数 ${n} 個が、上限 $((n - 1)) 個を超えています"
+}
+
+# --rebuild も同じ上限で止まる(Zip は作らない・タグはそのまま).
+test_size_limits_apply_to_rebuild() {
+	need_real_wp || return 0
+	mk_docroot lim_rb
+	run_tool my-plugin; assert_rc 0
+	rm -f "${OUTD}/my-plugin.1.2.3.zip"
+	set_config "tag_format = {slug}/{version}
+output = ${OUTD}
+max_files = 1
+plugin ${P}"
+	run_tool my-plugin --rebuild
+	assert_rc 1
+	assert_has "大きさの上限を超えています"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "my-plugin/1.2.3" "$(git tag | head -n 1)" "タグ(そのまま)"
+}
+
 # Zip の展開(unzip -d)は、build でも --rebuild でも、--manifest を付けても 1 回だけであること(1.1.0 までは、指紋とマニフェストで別々に展開した).
 # 指紋とマニフェストは同じ走査の結果から作る(マニフェストの各行の中身の一致は、上のテストが shasum -c で確かめる).
 # 展開の回数は、unzip の前に置いた記録用のラッパーで数える(展開する呼び出しは -d を持つ. 一覧の -Z1・-Zt・-p は数えない).
