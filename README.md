@@ -87,6 +87,7 @@ wp-release-zip-maker <slug> [--rebuild [<版>]] --dry-run --verify-content   # Z
 wp-release-zip-maker <slug> --rebuild [<版>]   # 既存のタグの時点から Zip だけを作り直す(タグは打たない)
 wp-release-zip-maker <slug> --rebuild [<版>] --allow-content-change   # 内容の指紋がタグの記録と違っても続ける
 wp-release-zip-maker <slug> [--rebuild [<版>]] --manifest             # Zip のファイルごとの SHA-256 の一覧も作る
+wp-release-zip-maker <slug> [--rebuild [<版>]] --json <パス>          # 機械が読める JSON のレポートも作る
 wp-release-zip-maker --list                    # 設定にある対象と、今の版・タグの有無を一覧にする
 wp-release-zip-maker --version / --help
 ```
@@ -163,6 +164,54 @@ check    wp-content/plugins/my-plugin/package.json:"version"
 - 目安にする値は、実際の Zip から決めてください(2026-10-28 に測った例: プラグイン 170KB・72 ファイル・展開後 440KB / テーマ 424KB・107 ファイル・展開後 660KB / 画像の多いディレクトリ 3.5MB・30 ファイル・展開後 3.8MB)。上の例の値は書き方の見本です
 - 展開後の大きさは `unzip -Zt` の「N bytes uncompressed」から読みます(読めなければ `unzip -l` の合計の行)。書式は Info-ZIP の版で違う可能性があり、この Mac の `unzip` 6.00 でだけ確かめました。読めなければ、`max_uncompressed_bytes` を確かめられないので止めます
 - **1.1.0 以前のツールは、知らないキーで止まります。** 使うなら `requires = 1.2.0` にしてください
+
+### 機械が読めるレポート(`--json <パス>`)
+
+build・`--rebuild` が成功したあと、指定したパスに JSON のファイルを作ります(CI やほかのスクリプトが、Zip の版・指紋を読むためのものです)。
+
+- パスは、カレントディレクトリからの相対パスでも絶対パスでもかまいません。親のディレクトリが無ければ作ります
+- **上書きしません。** すでにあれば、Zip もタグも作らずに止めます(`--manifest` と同じ)
+- `--dry-run`・`--list` とは使えません(使い方の誤りで、終了コード 2)
+- 標準出力に出す形(`--json` だけ)にしないのは、今の表示も標準出力に出ていて、混ざるためです(表示を標準エラーへ移すと、今の使い方が変わります)
+- **作れなかったとき**(置き場所に書けないなど): Zip とタグは**消さずに残し**、手順の表示まで進めたあと、警告して終了コード 1 で終わります(メッセージで「Zip とタグは正しくできている」と伝えます)。JSON は記録のためのもので、配布物ではないためです。これは `--manifest`(作れなければ Zip も消し、タグも打たない)と違う扱いです
+- jq などに頼らず、シェルだけで書き出します。パスに `"`・`\`・改行があってもエスケープされます(ASCII 以外はそのまま UTF-8 で出します)
+
+```json
+{
+  "tool_version": "1.2.0",
+  "slug": "my-plugin",
+  "kind": "plugin",
+  "version": "1.2.3",
+  "action": "build",
+  "tag": "my-plugin/1.2.3",
+  "commit": "<コミットのハッシュ(40 桁)>",
+  "branch": "main",
+  "zip": "/abs/path/my-plugin.1.2.3.zip",
+  "bytes": 12345,
+  "sha256": "<Zip 全体の SHA-256>",
+  "content_sha256": "<内容の指紋(タグの Content-SHA-256 と同じ)>",
+  "files": 72,
+  "uncompressed_bytes": 450000,
+  "manifest": null,
+  "signed": false,
+  "built_with": { "wp_cli": "2.12.0", "dist_archive": "3.1.0", "zip": "3.0" },
+  "created_at": "2026-10-28T16:30:00+09:00"
+}
+```
+
+| キー | 中身 |
+| --- | --- |
+| `action` | `build` か `rebuild` |
+| `tag` | タグ名(`rebuild` は、作り直す元のタグ) |
+| `commit` | Zip の元のコミット(`rebuild` は、タグが指すコミット) |
+| `branch` | build のときのブランチ名。detached HEAD と `rebuild` は `null`(`rebuild` はタグの時点から作るため) |
+| `sha256` / `content_sha256` | Zip 全体の SHA-256 / 内容の指紋(`rebuild` では前者は毎回変わります。「動作の詳細」の `Content-SHA-256` を参照) |
+| `files` / `uncompressed_bytes` | ファイルの数(ディレクトリは数えない)/ 展開後の合計。読めなければ `uncompressed_bytes` は `null` |
+| `manifest` | `--manifest` を付けたときはそのパス、付けなければ `null` |
+| `signed` | `--sign` を付けたか(`git config tag.gpgSign` による署名は反映しません) |
+| `built_with` | Zip を作った道具の版(調べられなければ `"unknown"`) |
+| `content_match` | **`rebuild` のときだけ**。タグの記録と内容の指紋が一致したら `true`、違えば `false`(`--allow-content-change` で続けたとき)、記録がなければ `null` |
+| `created_at` | ISO 8601(ローカル時刻 + オフセット) |
 
 ### 中身まで確かめる(`--dry-run --verify-content`)
 

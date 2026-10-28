@@ -8,6 +8,7 @@
 ### Added
 
 - 大きさの上限(省略可・既定は無し): `.wp-release` に `max_zip_bytes`(Zip の大きさ)・`max_files`(ファイルの数. ディレクトリは数えない)・`max_uncompressed_bytes`(展開後の合計)を書ける. 値は正の整数で、末尾に `K`・`M`・`G`(1024 の倍数)を付けてよい. 書いたものだけ確かめ、Zip を作って検査した直後(出力先へ置く前・タグを打つ前)に確かめる. `--rebuild` も同じ. 超えたら終了コード 1 で止め、Zip を置かず、タグも打たず、超えた項目と値・大きいファイルの上位 10 個・直下の内訳を出す. 上限以下なら要約に「上限: 〜 以下」を出す. 書き方の誤りは、行番号つきで止める(`--list` も). 1.1.0 以前のツールは知らないキーで止まるので、使うなら `requires = 1.2.0` にする
+- `--json <パス>`: build・`--rebuild` の成功のあと、機械が読める JSON のレポート(`tool_version`・`slug`・`kind`・`version`・`action`・`tag`・`commit`・`branch`・`zip`・`bytes`・`sha256`・`content_sha256`・`files`・`uncompressed_bytes`・`manifest`・`signed`・`built_with`・`created_at`. `--rebuild` は `content_match` も)を作る. 上書きしない(すでにあれば、事前の確認で止める). `--dry-run`・`--list` とは使えない(終了コード 2). 作れなかったときは、Zip とタグを残し、手順の表示のあとに警告して終了コード 1(`--manifest` と違う扱い. JSON は記録のためで配布物ではないため). jq には頼らず、シェルで書き出す(`"`・`\`・制御文字をエスケープ). 内部では、`publish_zip` に「置けなくても止めない」引数を足した
 - `--dry-run --verify-content`: 事前の確認のあと、一時ディレクトリに Zip を作り、本番と同じ確認(中身の検査・大きさの上限・名前の警告)をして、サマリーを出して Zip を消す. 出力先・タグ・マニフェストには何も作らない. `--rebuild --dry-run --verify-content` は、タグの記録の指紋との比較も出す(確認だけなので、違っても止めない). `--dry-run` と一緒のときだけ指定できる(ほかは終了コード 2). 内部では、`make_zip` が「置く」を省けるようにした(`make_zip` の 6 番目の引数)
 
 ### Changed

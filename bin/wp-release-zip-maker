@@ -78,6 +78,9 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
   ${PROG} <slug> [--rebuild [<版>]] --dry-run --verify-content
       確認のあと、一時ディレクトリに Zip を作り、本番と同じ中身の確認(検査・大きさの上限・名前の警告)をして、
       サマリーを出して Zip を消す. 出力先・タグ・マニフェストには何も作らない. --dry-run のときだけ指定できる
+  ${PROG} <slug> [--rebuild [<版>]] --json <パス>
+      成功したあと、機械が読める JSON のレポート(版・タグ・コミット・Zip の大きさと SHA-256・内容の指紋など)を、
+      <パス>(カレントからの相対でもよい)に作る. 上書きしない. --dry-run・--list とは使えない
   ${PROG} <slug> [--rebuild [<版>]] --manifest
       Zip のファイルごとの SHA-256 の一覧(<slug>.<版>.manifest.txt)も、出力先に作る
   ${PROG} <slug> --rebuild [<版>]
@@ -690,6 +693,8 @@ TMP_WORK=""
 ZIP_SCAN_FILE=""
 # make_zip が作った Zip の、一時ディレクトリの中のパス(置く前の Zip. --verify-content は、これを表示して消す).
 BUILT_ZIP=""
+# check_rebuild_digest の結果(--json の content_match 用): 1 = 一致 / 0 = 不一致 / 空 = 記録なし・比べられない.
+REBUILD_CONTENT_MATCH=""
 # 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
 PART_FILE=""
 
@@ -863,34 +868,52 @@ ${wp_out}"
 
 # 作ったファイル($1)を、最終のパス($2)へ、上書きせずに置く. すでに何かあれば(壊れたシンボリックリンクも)、置かずに止める.
 # $3 = 表示に使う呼び名(省略すると Zip. マニフェストも同じ手順で置くため).
+# $4 = 1 なら、置けなくても止めずに、メッセージを出して 1 を返す(--json のレポート用. 置けなくても、Zip とタグはできているため).
+#   省略(0)なら、置けないときは die で止める(Zip・マニフェスト).
 # 手順: 出力先と同じディスク上の一時ファイルへコピー → ln(ハードリンク)で最終のパスの名前を作る → 一時ファイルを消す.
 #   ln は、行き先がすでにあれば必ず失敗する(確認と作成が 1 つの操作になる). 一時ファイルは出力先と同じディスクに作るので、ln が使える.
 #   ハードリンクを作れないファイルシステムでは、mv -n で置く(あとで一時ファイルが残っていれば、すでにあったと判断する).
 # 一時ファイルは mktemp の 0600 のままにせず、umask どおりの権限にする(以前の dist-archive の出力と同じ).
 publish_zip() {
-	local src="$1" dest="$2" label="${3:-Zip}" dir mode
+	local src="$1" dest="$2" label="${3:-Zip}" soft="${4:-0}" dir mode
 	dir="$(dirname "${dest}")"
-	mkdir -p -- "${dir}" || die "出力先 ${dir} を作れません."
-	PART_FILE="$(mktemp "${dir}/.$(basename "${dest}").XXXXXX")" || die "出力先 ${dir} に一時ファイルを作れません(書き込めますか?)."
+	if ! mkdir -p -- "${dir}"; then
+		publish_fail "${soft}" "出力先 ${dir} を作れません." || return 1
+	fi
+	if ! PART_FILE="$(mktemp "${dir}/.$(basename "${dest}").XXXXXX")"; then
+		PART_FILE=""
+		publish_fail "${soft}" "出力先 ${dir} に一時ファイルを作れません(書き込めますか?)." || return 1
+	fi
 	mode="$(printf '%o' $((0666 & ~$(umask))))"
 	if ! { cp -- "${src}" "${PART_FILE}" && chmod "${mode}" "${PART_FILE}"; }; then
-		die "${label} を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)."
+		publish_fail "${soft}" "${label} を出力先 ${dir} へコピーできません(ディスクの空きは足りていますか?)." || return 1
 	fi
 	if [ -e "${dest}" ] || [ -L "${dest}" ]; then
-		die "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+		publish_fail "${soft}" "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください." || return 1
 	fi
 	if ! ln -- "${PART_FILE}" "${dest}" 2>/dev/null; then
 		if [ -e "${dest}" ] || [ -L "${dest}" ]; then
-			die "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください."
+			publish_fail "${soft}" "${label} がすでにあります(${dest}). このツールは上書きしません(作っている間に、別のプロセスが作りましたか?). 確かめて消してから実行してください." || return 1
 		fi
 		# ハードリンクを作れない(ln が使えないファイルシステム). mv -n は、行き先があれば動かない.
 		mv -n -- "${PART_FILE}" "${dest}" 2>/dev/null
 		if [ -e "${PART_FILE}" ]; then
-			die "${label} を ${dest} へ置けませんでした(すでにあるか、書き込めません)."
+			publish_fail "${soft}" "${label} を ${dest} へ置けませんでした(すでにあるか、書き込めません)." || return 1
 		fi
 	fi
 	rm -f -- "${PART_FILE}"
 	PART_FILE=""
+}
+
+# publish_zip の失敗の扱い. $1 = 1 なら、メッセージを出して作りかけの一時ファイルを消し、1 を返す(呼び出し側が続ける). 0 なら die で止める(一時ファイルは終了時に消える).
+publish_fail() {
+	local soft="$1"
+	shift
+	[ "${soft}" -eq 1 ] || die "$*"
+	err "${PROG}: $*"
+	[ -z "${PART_FILE}" ] || rm -f -- "${PART_FILE}"
+	PART_FILE=""
+	return 1
 }
 
 # Zip に入るファイル名に ASCII 以外(日本語など)があれば警告する(止めはしない).
@@ -1086,6 +1109,102 @@ print_top_level_breakdown() {
 	unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '$0 !~ /\/$/ && NF >= 2 && $2 != "" { c[$2]++ } END { for (k in c) printf "  %5d  %s\n", c[k], k }' | LC_ALL=C sort -k2 | head -n 40
 }
 
+# --- JSON のレポート(--json) --------------------------------------------------------------------
+
+# 文字列($1)を JSON の文字列の中身(両端の " を除く)にして標準出力へ出す.
+# 変えるもの: \ と " と制御文字(0x00〜0x1f. \n・\t・\r・\b・\f はその書き方、ほかは \u00XX). ASCII 以外のバイトは、そのまま出す(UTF-8 前提).
+# 改行を含む文字列も 1 つの値として扱うため、行ごとに処理して \n でつなぐ. 末尾の改行が落ちないよう、番兵の '_' を付けて渡し、最後に外す.
+json_escape() {
+	printf '%s_' "$1" | LC_ALL=C awk '
+		BEGIN {
+			for (i = 1; i < 32; i++) m[sprintf("%c", i)] = sprintf("\\u%04x", i)
+			m["\t"] = "\\t"; m["\r"] = "\\r"; m["\b"] = "\\b"; m["\f"] = "\\f"
+		}
+		{
+			n = length($0); out = ""
+			for (i = 1; i <= n; i++) {
+				ch = substr($0, i, 1)
+				if (ch == "\\") out = out "\\\\"
+				else if (ch == "\"") out = out "\\\""
+				else if (ch in m) out = out m[ch]
+				else out = out ch
+			}
+			res = (NR > 1 ? res "\\n" : "") out
+		}
+		END { printf "%s", substr(res, 1, length(res) - 1) }
+	'
+}
+
+# JSON の文字列の値(両端の " つき). $1 = 文字列. 空なら null にしたいときは、呼び出し側が json_str_or_null を使う.
+json_str() {
+	printf '"%s"' "$(json_escape "$1")"
+}
+
+# 空なら null、あれば JSON の文字列.
+json_str_or_null() {
+	if [ -z "$1" ]; then
+		printf 'null'
+	else
+		json_str "$1"
+	fi
+}
+
+# 今の時刻を ISO 8601(ローカル時刻 + オフセット. 例: 2026-10-28T16:30:00+09:00)で標準出力へ出す.
+# date の %z は +0900 の形(コロンなし)なので、コロンを入れる.
+iso_now() {
+	date '+%Y-%m-%dT%H:%M:%S%z' | sed 's/\([+-][0-9][0-9]\)\([0-9][0-9]\)$/\1:\2/'
+}
+
+# レポートの JSON を作って、$1 のパスへ上書きせずに置く. 置けなければ、メッセージを出して 1 を返す(Zip とタグは、そのまま残す).
+# 値は、作り終えた Zip とタグから読む(内容の指紋・ファイル数は make_zip の走査の結果と同じもの).
+#   $1 = 置くパス / $2 = スラッグ / $3 = 種類 / $4 = 版 / $5 = 動作(build か rebuild) / $6 = タグ名 / $7 = コミット(フルのハッシュ)
+#   $8 = ブランチ(build のときだけ. 空なら null) / $9 = Zip のパス / ${10} = マニフェストのパス(無ければ空) / ${11} = 1 なら署名付き(--sign)
+#   ${12} = --rebuild の内容の比較(1 = 一致・0 = 不一致・空 = 記録なし. build では使わない)
+write_json_report() {
+	local dest="$1" slug="$2" kind="$3" ver="$4" action="$5" tag="$6" commit="$7" branch="$8" zip_file="$9"
+	local manifest_path="${10}" sign="${11}" match="${12}" tmp bytes unc
+	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || { err "${PROG}: 一時ディレクトリが無く、JSON を作れません."; return 1; }
+	tmp="${TMP_WORK}/report.json"
+	bytes="$(wc -c <"${zip_file}")"
+	bytes=$((bytes))
+	unc="$(zip_uncompressed_bytes "${zip_file}")" || unc=""
+	{
+		printf '{\n'
+		printf '  "tool_version": %s,\n' "$(json_str "${WP_RELEASE_ZIP_MAKER_VERSION}")"
+		printf '  "slug": %s,\n' "$(json_str "${slug}")"
+		printf '  "kind": %s,\n' "$(json_str "${kind}")"
+		printf '  "version": %s,\n' "$(json_str "${ver}")"
+		printf '  "action": %s,\n' "$(json_str "${action}")"
+		printf '  "tag": %s,\n' "$(json_str "${tag}")"
+		printf '  "commit": %s,\n' "$(json_str "${commit}")"
+		printf '  "branch": %s,\n' "$(json_str_or_null "${branch}")"
+		printf '  "zip": %s,\n' "$(json_str "${zip_file}")"
+		printf '  "bytes": %s,\n' "${bytes}"
+		printf '  "sha256": %s,\n' "$(json_str "$(sha256_of "${zip_file}")")"
+		printf '  "content_sha256": %s,\n' "$(json_str_or_null "$(zip_content_digest)")"
+		printf '  "files": %s,\n' "$(zip_file_count "${zip_file}")"
+		printf '  "uncompressed_bytes": %s,\n' "${unc:-null}"
+		printf '  "manifest": %s,\n' "$(json_str_or_null "${manifest_path}")"
+		printf '  "signed": %s,\n' "$([ "${sign}" -eq 1 ] && echo true || echo false)"
+		printf '  "built_with": {\n'
+		printf '    "wp_cli": %s,\n' "$(json_str "$(wp_cli_version)")"
+		printf '    "dist_archive": %s,\n' "$(json_str "$(dist_archive_version)")"
+		printf '    "zip": %s\n' "$(json_str "$(zip_version)")"
+		printf '  },\n'
+		if [ "${action}" = rebuild ]; then
+			case "${match}" in
+				1) printf '  "content_match": true,\n' ;;
+				0) printf '  "content_match": false,\n' ;;
+				*) printf '  "content_match": null,\n' ;;
+			esac
+		fi
+		printf '  "created_at": %s\n' "$(json_str "$(iso_now)")"
+		printf '}\n'
+	} >"${tmp}" || { err "${PROG}: JSON を一時ファイルへ書けませんでした."; return 1; }
+	publish_zip "${tmp}" "${dest}" "JSON のレポート" 1 || return 1
+	printf 'JSON:       %s\n' "${dest}"
+}
+
 # --- タグ ---------------------------------------------------------------------------------------
 
 # タグのメッセージの、見出し($2)の行の残り全部(空白は前後を取る)を標準出力へ出す. 無ければ何も出さない. $1 = タグ名.
@@ -1258,6 +1377,7 @@ verify_content_run() {
 #   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
 #   $7 = 1 なら、署名付きのタグを打つ(--sign. 通常の実行だけ)
 #   $8 = 1 なら、--dry-run のあと Zip を一時ディレクトリに作って中身まで確かめ、消す(--verify-content. --dry-run のときだけ)
+#   $9 = JSON のレポートを作るパス(絶対パス. 空なら作らない. --json. --dry-run とは使えない)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1265,7 +1385,7 @@ verify_content_run() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" manifest_file=""
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" json_file="${9:-}" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1366,6 +1486,12 @@ cmd_build() {
 		fi
 	fi
 
+	# JSON のレポート(--json): 上書きしない. すでにあれば、何も作らずに止める(Zip とタグを作ってから分かると、記録だけが残らないため、ここで確かめる).
+	# 作る時点で置けなかったときは、Zip とタグを残したまま警告する(finish_json_report)ので、ここで防げるのは「すでにある」だけ.
+	if [ -n "${json_file}" ] && { [ -e "${json_file}" ] || [ -L "${json_file}" ]; }; then
+		die "JSON のレポートがすでにあります(${json_file}). このツールは上書きしません. 確かめて消してから実行してください."
+	fi
+
 	# マニフェスト(--manifest): Zip と同じく上書きしない. すでにあれば、何も作らずに止める(Zip だけ作ってから止まらないよう、ここで確かめる).
 	if [ "${manifest}" -eq 1 ]; then
 		manifest_file="${out}/${slug}.${ver}.manifest.txt"
@@ -1433,7 +1559,9 @@ cmd_build() {
 		if [ "${manifest}" -eq 1 ]; then
 			write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました)."; }
 		fi
+		finish_json_report "${json_file}" "${slug}" "${kind}" "${ver}" rebuild "${tag}" "${ref}" "" "${zip_file}" "$([ "${manifest}" -eq 1 ] && printf '%s' "${manifest_file}")" 0 "${REBUILD_CONTENT_MATCH}"
 		print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
+		end_json_report
 		return 0
 	fi
 
@@ -1453,7 +1581,26 @@ cmd_build() {
 	print_zip_summary "${slug}" "${zip_file}"
 	printf '\nタグ:       %s を打ちました(注釈付き%s・コミット %s).\n' "${tag}" "$([ "${sign}" -eq 0 ] || printf '・署名付き')" "${short}"
 	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
+	finish_json_report "${json_file}" "${slug}" "${kind}" "${ver}" build "${tag}" "${ref}" "$([ "${branch}" = "(detached HEAD)" ] || printf '%s' "${branch}")" "${zip_file}" "$([ "${manifest}" -eq 1 ] && printf '%s' "${manifest_file}")" "${sign}" ""
 	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
+	end_json_report
+}
+
+# --json の最後の始末. Zip とタグができたあと(手順の表示の前)に、レポートを作る. 作れなくても止めない(手順の表示まで進める).
+# 作れなかったら JSON_REPORT_FAILED を立て、end_json_report が、手順の表示のあとに終了コード 1 で終わる.
+# 理由: JSON は記録のためのもので、配布物ではない. Zip とタグは正しくできているので、消さない(--manifest は配布物と対なので、作れなければ Zip も消す).
+#   引数は write_json_report と同じ(最初の $1 が空なら、何もしない).
+JSON_REPORT_FAILED=0
+finish_json_report() {
+	[ -n "$1" ] || return 0
+	write_json_report "$@" || JSON_REPORT_FAILED=1
+}
+
+end_json_report() {
+	[ "${JSON_REPORT_FAILED}" -eq 1 ] || return 0
+	err ""
+	err "${PROG}: JSON のレポートを作れませんでした. Zip とタグは、正しくできています(消していません). レポートだけ、確かめてから作り直してください."
+	exit "${EXIT_STOP}"
 }
 
 # 内容が違ったとき、Zip を作った道具の版を「タグの記録 → 今回」で並べて表示する(違うものに印を付ける).
@@ -1502,9 +1649,11 @@ check_rebuild_digest() {
 	elif [ -z "${recorded}" ]; then
 		printf '  タグ %s に、内容の指紋(Content-SHA-256)の記録がありません(古いタグ、または別の方法で打ったタグ). 中身(上の内訳)を目で確かめてください.\n' "${tag}"
 	elif [ "${recorded}" = "${now}" ]; then
+		REBUILD_CONTENT_MATCH=1
 		printf '  内容の指紋が、タグの記録と一致しました(元の Zip と同じファイル・同じ内容です).\n'
 	else
 		mismatch=1
+		REBUILD_CONTENT_MATCH=0
 		printf '  内容の指紋が、タグの記録と違います.\n    タグの記録: %s\n    今回:       %s\n' "${recorded}" "${now}"
 		printf '  .distignore・zip・wp dist-archive の版や、タグの後の環境の違いで、入るファイルが変わった可能性があります. 中身(上の内訳)を確かめてください.\n'
 		print_tool_version_comparison "${tag}"
@@ -1679,7 +1828,7 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 verify_content=0
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 verify_content=0 json_file=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
@@ -1689,6 +1838,19 @@ main() {
 			--manifest) manifest=1 ;;
 			--sign) sign=1 ;;
 			--verify-content) verify_content=1 ;;
+			--json)
+				# 値は次の引数. 無い・空・オプションの形('-' で始まる)なら使い方の誤り.
+				if [ "$#" -lt 2 ] || [ -z "$2" ] || [ "${2#-}" != "$2" ]; then
+					err "${PROG}: --json にはレポートを作るパスを付けてください(例: --json report.json)."
+					exit "${EXIT_USAGE}"
+				fi
+				# カレントからの相対パスは、ここで絶対パスにする(以後 cd しても変わらない).
+				case "$2" in
+					/*) json_file="$(normalize_path "$2")" ;;
+					*) json_file="$(normalize_path "${PWD}/$2")" ;;
+				esac
+				shift
+				;;
 			-*)
 				err "${PROG}: 不明なオプション '$1'"
 				err "'${PROG} --help' で使い方を確認してください."
@@ -1710,7 +1872,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${verify_content}" -eq 1 ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${verify_content}" -eq 1 ] || [ -n "${json_file}" ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1746,7 +1908,13 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}"
+	# --json は、成功したあとのレポート. --dry-run は何も作らないので、一緒には使えない.
+	if [ -n "${json_file}" ] && [ "${dry}" -eq 1 ]; then
+		err "${PROG}: --json は --dry-run と一緒に使えません(--dry-run は何も作らないので、レポートに書く Zip がありません)."
+		exit "${EXIT_USAGE}"
+	fi
+
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}" "${json_file}"
 }
 
 main "$@"
