@@ -13,7 +13,7 @@
 set -u
 
 # ツール自身の版. リリースのタグ(素の版番号)・CHANGELOG・README と必ずそろえる.
-WP_RELEASE_ZIP_MAKER_VERSION="1.0.1"
+WP_RELEASE_ZIP_MAKER_VERSION="1.1.0"
 
 # 自分の名前(--help などの表示用). シンボリックリンク経由で呼ばれても同じ名前を出す.
 PROG="wp-release-zip-maker"
