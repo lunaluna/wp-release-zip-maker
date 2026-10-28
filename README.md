@@ -52,7 +52,7 @@ wp-release-zip-maker --version      # 版が出れば、PATH が通っていま�
 
 - `main` は、リリースのときにだけ進みます(作業はブランチで進め、リリースのときに `main` へマージします)。`git pull` で取れるのは、いつも最新のリリースです
 - 新しい版が出たことを知るには、GitHub のリポジトリの **Watch → Custom → Releases** を選んでください。リリースのたびに GitHub の Release(1.1.0 から)を作るので、通知が届きます
-- 版を固定したいときは、タグを取り出します(`git -C ~/private/wp-release-zip-maker checkout 1.3.0`)。最新に戻すには `git checkout main` のあとで `git pull` します
+- 版を固定したいときは、タグを取り出します(`git -C ~/private/wp-release-zip-maker checkout 1.3.1`)。最新に戻すには `git checkout main` のあとで `git pull` します
 - フォークや Release からのダウンロードは要りません(更新を受け取りにくくなります)
 
 ## クイックスタート
@@ -180,7 +180,7 @@ build・`--rebuild` が成功したあと、指定したパスに JSON のファ
 
 ```json
 {
-  "tool_version": "1.3.0",
+  "tool_version": "1.3.1",
   "slug": "my-plugin",
   "kind": "plugin",
   "version": "1.2.3",
@@ -265,7 +265,18 @@ Zip もタグも作らずに、止めるべき状態がないかを確かめま�
 - 「既定のブランチ」(`main` と答えたときの切り替え先)は、`refs/heads/main` があれば `main`、無くて `refs/heads/master` があれば `master`、どちらも無ければ、切り替えの選択肢を出しません。両方あれば `main` です
 - **`main` と答えたとき**:
   1. 今の HEAD が既定のブランチに**入っているか**(マージ済みか)を確かめます。入っていなければ、**切り替えずに止めます**(終了コード 1。「work の 2 個のコミットが main に入っていません」)。切り替えても、そのコミットは Zip に入らないためです
-  2. `git switch` で切り替えます。失敗したら(未追跡のファイルがぶつかるなど)、Git のエラーを出して止めます(ブランチは元のまま)
+  2. `git switch` で切り替えます。失敗したら、**Git のエラーの原文**と、**原因・対処の説明**を出して止めます(終了コード 1。Zip もタグも作りません)。ブランチが元のままかも確かめて、伝えます。説明する原因は次のとおりです(Git 2.56.0 で、それぞれの場面を再現して確かめたメッセージで分類しています。メッセージが Git の版で変わると、分類が外れて「原因を特定できませんでした」になりますが、Git のエラーの原文は必ず出ます)
+
+     | 原因 | Git のエラー(英語にそろえて表示) | 対処の説明 |
+     | --- | --- | --- |
+     | 既定のブランチが、別の作業ツリー(`git worktree`)で使われている | `'main' is already used by worktree at '<パス>'` | その作業ツリーで別のブランチへ切り替える、またはそちらで作業する |
+     | ロックファイル(`.git/index.lock`)が残っている | `Unable to create '<パス>/.git/index.lock': File exists.` | Git の処理が動いていないことを確かめてから、ロックファイルを削除する |
+     | 未追跡のファイルが、既定のブランチのファイルで上書きされる | `The following untracked working tree files would be overwritten by checkout:` | そのファイルを移すか消すか、コミットする(ただし、未追跡のファイルがあると、その前の「作業ツリーの確認」で先に止まるので、実際には到達しにくい) |
+     | 未コミットの変更が上書きされる | `Your local changes ... would be overwritten by checkout` | コミットするか、`git stash` で退避する |
+     | 書き込めない | `Permission denied` など | 権限を確かめる |
+     | 上のどれでもない | - | 「原因を特定できませんでした」と言う |
+
+     なお、**無視(`.gitignore`)されているファイルが、既定のブランチのファイルと同じ名前のときは、Git は失敗せず、黙って上書きして切り替えます**(Git の仕様。2026-10-28 に確認)。大事なファイルを `.gitignore` に入れて、同名のファイルが既定のブランチにあるときは、切り替える前に退避してください
   3. **同じ引数でツールを起動し直し**、版・`check`・タグの有無・Zip の名前を、切り替えたあとのブランチで確かめ直します(切り替える前に読んだ値は使い回しません)。起動し直したあとは、もう聞きません
   4. 終わったあとも、既定のブランチにいたままです(元のブランチには戻しません)。最後に「ブランチ: main に切り替えました(元は work)。戻すなら: git switch work」と表示します
   - **`main` を最新にしてから使ってください。** このツールはネットワークに出ない(`git fetch` しない)ので、手元の `main` が `origin/main` より遅れていても気づけません
@@ -341,7 +352,7 @@ my-plugin 1.2.3
 Zip: my-plugin.1.2.3.zip
 SHA-256: <配布した Zip そのもの(バイト列)の SHA-256>
 Content-SHA-256: <Zip の内容の指紋>
-Built-with: wp-release-zip-maker 1.3.0
+Built-with: wp-release-zip-maker 1.3.1
 WP-CLI: 2.12.0
 dist-archive: 3.1.0
 zip: 3.0
@@ -492,7 +503,7 @@ tests/run.sh --help            # 使い方
 | lint | shellcheck の検査 | 1 | 0 | 4 秒 |
 | `10_cli` | 引数・`--help`・`--version`・`--verify-content`・`--json`・`--yes` の使い方の誤り | 13 | 0 | 1 秒 |
 | `20_config` | 設定ファイル `.wp-release` の読み込み(大きさの上限の書き方を含む)・`--list` | 15 | 0 | 3 秒 |
-| `30_preflight` | 事前の確認(`--dry-run`)の、止める条件のそれぞれ・`main` 以外のブランチからの確認(`y/n/main`)。偽の `wp` で動く | 49 | 0 | 41 秒 |
+| `30_preflight` | 事前の確認(`--dry-run`)の、止める条件のそれぞれ・`main` 以外のブランチからの確認(`y/n/main`)・切り替えの失敗の説明。偽の `wp` で動く | 51 | 0 | 41 秒 |
 | `40_zip` | Zip の作成・Zip の中身の確認・配布してはいけないファイルの検査・`--manifest`・大きさの上限・`--verify-content`・`--json`・`main` 以外のブランチからの Zip とタグの作成 | 42 | 41 | 60 秒 |
 | `50_tag_rebuild` | 注釈付きタグとその記録(道具の版を含む)・`--rebuild`・`--sign` | 29 | 29 | 62 秒 |
 | `60_deploy_hint` | アップロード手順の表示。dir の SSH の手順は疑似サーバーで実際に実行する | 14 | 14 | 28 秒 |

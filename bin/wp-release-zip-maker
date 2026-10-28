@@ -13,7 +13,7 @@
 set -u
 
 # ツール自身の版. リリースのタグ(素の版番号)・CHANGELOG・README と必ずそろえる.
-WP_RELEASE_ZIP_MAKER_VERSION="1.3.0"
+WP_RELEASE_ZIP_MAKER_VERSION="1.3.1"
 
 # 自分の名前(--help などの表示用). シンボリックリンク経由で呼ばれても同じ名前を出す.
 PROG="wp-release-zip-maker"
@@ -1446,6 +1446,47 @@ confirm_branch() {
 	done
 }
 
+# git switch が失敗した理由を、Git のエラー($1)から読み取って、日本語で説明する(標準エラーへ. 原因と対処).
+#   $1 = Git のエラー(LC_ALL=C で取った英語のメッセージ. 文言で分類するため、ロケールで変わらないようにしている) / $2 = 切り替え先のブランチ名
+# 分類は、この Mac の Git 2.56.0 で、それぞれの場面を再現して取ったメッセージによる(2026-10-28):
+#   別の worktree で使われている → "fatal: '<ブランチ>' is already used by worktree at '<パス>'"(古い Git は "is already checked out at")
+#   ロックファイルが残っている   → "fatal: Unable to create '<パス>/.git/index.lock': File exists."
+#   未追跡のファイルがぶつかる   → "error: The following untracked working tree files would be overwritten by checkout:" + 1 行ずつのファイル名
+#   (無視されたファイルがぶつかるときは、Git は失敗せず、黙って上書きして切り替える.)
+# 上の 3 つのほかに、未コミットの変更がぶつかる("would be overwritten by checkout")・権限("Permission denied" など)も分ける.
+# どれにも当たらなければ「原因を特定できませんでした」と言う(Git のエラーは、呼び出し側が先に表示している). 文言が Git の版で変わっても、この分類が外れるだけで、止まることは変わらない.
+explain_switch_failure() {
+	local out="$1" def="$2" wt files
+	case "${out}" in
+		*"already used by worktree"* | *"already checked out"*)
+			# "... at '<パス>'" の <パス> を取る(sed の \| は macOS の sed で使えないので、行を先に grep で絞る).
+			wt="$(printf '%s\n' "${out}" | grep -m 1 'already' | sed -n "s/.* at '\(.*\)'.*/\1/p")"
+			err "  原因: ${def} が、別の作業ツリー(git worktree)で使われています${wt:+: ${wt}}. 同じブランチは、複数の作業ツリーで同時に使えません."
+			err "  対処: そちらの作業ツリーで別のブランチへ切り替えるか、そちらで作業してください(使わない作業ツリーは git worktree remove で消せます)."
+			;;
+		*"index.lock"* | *"Unable to create"*"File exists"*)
+			err "  原因: Git のロックファイル(.git/index.lock)が残っています. 別の Git の処理(エディターの Git 機能・別のターミナルなど)が動いているか、前回の処理が途中で終わった可能性があります."
+			err "  対処: Git の処理が動いていないことを確かめてから、上のエラーに書かれたロックファイルを削除して、もう一度実行してください."
+			;;
+		*"untracked working tree files would be overwritten"*)
+			files="$(printf '%s\n' "${out}" | sed -n 's/^[[:space:]][[:space:]]*\(.*[^[:space:]]\)[[:space:]]*$/\1/p' | head -n 5 | tr '\n' ' ')"
+			err "  原因: 未追跡のファイル(${files% })が、${def} にある同じ名前のファイルで上書きされてしまうため、Git が切り替えを断りました."
+			err "  対処: そのファイルを移すか消すか、コミットしてから、もう一度実行してください."
+			;;
+		*"would be overwritten by checkout"*)
+			err "  原因: 未コミットの変更が、${def} の内容で上書きされてしまうため、Git が切り替えを断りました."
+			err "  対処: 変更をコミットするか、git stash で退避してから、もう一度実行してください."
+			;;
+		*"Permission denied"* | *"Operation not permitted"* | *"Read-only file system"*)
+			err "  原因: ファイルまたはディレクトリに書き込めません(権限・読み取り専用・所有者の違いなど)."
+			err "  対処: 上のエラーに書かれたパスの権限を確かめてください."
+			;;
+		*)
+			err "  原因を特定できませんでした. 上の Git のエラーを確かめてください."
+			;;
+	esac
+}
+
 # 「main」(既定のブランチ)と答えたとき: 今の HEAD が既定のブランチに入っていることを確かめ、切り替え、同じ引数でツールを起動し直す.
 #   $1 = 今のブランチ名 / $2 = 既定のブランチ名
 # 入っていなければ(マージされていなければ)切り替えずに止める(終了コード 1). 切り替えても、そのコミットは Zip に入らず、
@@ -1454,14 +1495,26 @@ confirm_branch() {
 # 起動し直す(exec)のは、版・check・タグの有無・Zip の名前を、すべて切り替えたあとの HEAD で確かめ直すため(切り替える前に読んだ値を使い回さない).
 #   起動し直したあとは、既定のブランチにいるので、もう聞かない(無限ループにならない). 元のブランチ名は環境変数で渡し、最後の表示に使う.
 switch_to_default_and_restart() {
-	local from="$1" def="$2" n out
+	local from="$1" def="$2" n out head_before branch_before
 	if ! git -C "${GIT_TOP}" merge-base --is-ancestor HEAD "${def}" 2>/dev/null; then
 		n="$(git -C "${GIT_TOP}" rev-list --count "${def}..HEAD" 2>/dev/null)" || n="?"
 		die "${from} の ${n} 個のコミットが ${def} に入っていません. 切り替えても、それらは Zip に入りません. 先に ${def} へマージしてから実行してください. ブランチは変えていません."
 	fi
-	if ! out="$(git -C "${GIT_TOP}" switch "${def}" 2>&1)"; then
+	head_before="$(git -C "${GIT_TOP}" rev-parse HEAD)"
+	branch_before="$(git -C "${GIT_TOP}" branch --show-current)"
+	# LC_ALL=C: Git のエラーの文言を英語にそろえる(explain_switch_failure が、文言で原因を分類するため). エラーの原文は、そのまま見せる.
+	if ! out="$(LC_ALL=C git -C "${GIT_TOP}" switch "${def}" 2>&1)"; then
 		err "${out}"
-		die "${def} へ切り替えられませんでした(Git のエラーは上のとおり). ブランチは変えていません."
+		err ""
+		err "${PROG}: ${def} へ切り替えられませんでした(Git のエラーは上のとおり)."
+		explain_switch_failure "${out}" "${def}"
+		# 本当に変わっていないかを確かめてから、そう伝える(失敗の途中で変わっていることはまれだが、言い切らない).
+		if [ "$(git -C "${GIT_TOP}" rev-parse HEAD)" = "${head_before}" ] && [ "$(git -C "${GIT_TOP}" branch --show-current)" = "${branch_before}" ]; then
+			err "  ブランチは変えていません(今も ${from} です). Zip もタグも作っていません."
+		else
+			err "  ブランチが変わっている可能性があります. git status で確かめてください. Zip もタグも作っていません."
+		fi
+		exit "${EXIT_STOP}"
 	fi
 	err "${def} に切り替えました(HEAD $(git -C "${GIT_TOP}" rev-parse --short HEAD)). ${def} で改めて確かめます."
 	export "${SWITCHED_FROM_VAR}=${from}"

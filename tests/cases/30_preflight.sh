@@ -534,6 +534,83 @@ test_branch_prompt_does_not_loop_after_a_restart() {
 	assert_lacks "このまま work で"
 }
 
+# 「main」の答えで git switch が失敗したとき: Git のエラーの原文と、原因・対処の説明を出して止める(終了コード 1). ブランチは変えない.
+# 失敗は、git の前に置く偽の git(switch のときだけ、決めたメッセージを出して失敗する. ほかは本物の git へ渡す)で再現する.
+# (本物の再現が作れるのは worktree だけ. 未追跡のファイルがぶつかる場面は、そもそも作業ツリーの確認で先に止まるため、実際には到達しにくい.)
+
+# 偽の git を作り、そのディレクトリを標準出力へ出す. $1 = 名前 / $2 = switch で出すメッセージ(printf %b の形) / $3 = 終了コード
+make_fake_git_switch() {
+	local d="${TEST_ROOT}/fakegit-$1" real
+	real="$(command -v git)"
+	mkdir -p "${d}"
+	printf '#!/bin/sh\ncase " $* " in *" switch "*) printf "%%b" "%s" >&2; exit %s ;; esac\nexec "%s" "$@"\n' "$2" "$3" "${real}" > "${d}/git"
+	chmod +x "${d}/git"
+	printf '%s' "${d}"
+}
+
+# 偽の git を前に置いて、main と答える. $1 = 偽の git のディレクトリ.
+pf_tty_main_with_fake_git() {
+	OUT="$(printf 'main\n' | env "WP_RELEASE_ZIP_MAKER_WP=${FAKE_WP}" WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 "PATH=$1:${PATH}" "${TOOL_BASH}" "${TOOL}" my-plugin 2>&1)"
+	RC=$?
+}
+
+# 原因ごとの説明(別の worktree・ロックファイル・未追跡のファイル・未コミットの変更・権限・不明).
+test_switch_failure_explains_the_cause() {
+	pf_setup sw1
+	git switch -q -c work    # work は main と同じコミット(main に入っている)
+	local d
+	d="$(make_fake_git_switch wt "fatal: 'main' is already used by worktree at '/tmp/other-wt'\n" 128)"
+	LABEL="別の worktree"; pf_tty_main_with_fake_git "${d}"
+	assert_rc 1
+	assert_has "fatal: 'main' is already used by worktree at '/tmp/other-wt'"   # Git のエラーの原文
+	assert_has "main へ切り替えられませんでした"
+	assert_has "原因: main が、別の作業ツリー(git worktree)で使われています: /tmp/other-wt"
+	assert_has "対処: そちらの作業ツリーで別のブランチへ切り替えるか"
+	d="$(make_fake_git_switch lock "fatal: Unable to create '/repo/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository\n" 128)"
+	LABEL="ロックファイル"; pf_tty_main_with_fake_git "${d}"
+	assert_rc 1
+	assert_has "原因: Git のロックファイル(.git/index.lock)が残っています"
+	assert_has "ロックファイルを削除して"
+	d="$(make_fake_git_switch untracked "error: The following untracked working tree files would be overwritten by checkout:\n\tm\n\tdir/n.txt\nPlease move or remove them before you switch branches.\nAborting\n" 1)"
+	LABEL="未追跡のファイル"; pf_tty_main_with_fake_git "${d}"
+	assert_rc 1
+	assert_has "原因: 未追跡のファイル(m dir/n.txt)が、main にある同じ名前のファイルで上書きされてしまう"
+	assert_has "そのファイルを移すか消すか、コミットしてから"
+	d="$(make_fake_git_switch local "error: Your local changes to the following files would be overwritten by checkout:\n\ta.php\nPlease commit your changes or stash them before you switch branches.\nAborting\n" 1)"
+	LABEL="未コミットの変更"; pf_tty_main_with_fake_git "${d}"
+	assert_rc 1
+	assert_has "原因: 未コミットの変更が、main の内容で上書きされてしまう"
+	assert_has "git stash で退避"
+	d="$(make_fake_git_switch perm "error: unable to create file a.php: Permission denied\n" 1)"
+	LABEL="権限"; pf_tty_main_with_fake_git "${d}"
+	assert_rc 1
+	assert_has "原因: ファイルまたはディレクトリに書き込めません"
+	d="$(make_fake_git_switch unknown "fatal: something unexpected\n" 1)"
+	LABEL="不明"; pf_tty_main_with_fake_git "${d}"
+	assert_rc 1
+	assert_has "fatal: something unexpected"
+	assert_has "原因を特定できませんでした. 上の Git のエラーを確かめてください."
+	# どの場合も、止まって何も作らず、ブランチは元のまま(説明にも、そう出る).
+	assert_has "ブランチは変えていません(今も work です). Zip もタグも作っていません."
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+}
+
+# 本物の git で、main が別の worktree で使われているとき(実際に起きうる唯一の場面).
+test_switch_failure_with_a_real_worktree() {
+	pf_setup sw2
+	git switch -q -c work
+	git worktree add -q "${TEST_ROOT}/other-wt-sw2" main
+	pf_tty 'main\n' my-plugin
+	assert_rc 1
+	assert_has "is already used by worktree at"
+	assert_has "main へ切り替えられませんでした"
+	assert_has "原因: main が、別の作業ツリー(git worktree)で使われています: "
+	assert_has "ブランチは変えていません(今も work です)"
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+}
+
 # --- コミット・コミッター --------------------------------------------------------------------------
 
 test_repository_without_commits_stops() {
