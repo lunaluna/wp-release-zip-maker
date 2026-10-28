@@ -13,7 +13,7 @@
 set -u
 
 # ツール自身の版. リリースのタグ(素の版番号)・CHANGELOG・README と必ずそろえる.
-WP_RELEASE_ZIP_MAKER_VERSION="1.2.0"
+WP_RELEASE_ZIP_MAKER_VERSION="1.3.0"
 
 # 自分の名前(--help などの表示用). シンボリックリンク経由で呼ばれても同じ名前を出す.
 PROG="wp-release-zip-maker"
@@ -73,6 +73,9 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
       HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない)
   ${PROG} <slug> --sign
       署名付きのタグ(git tag -s)を打つ. gpg と鍵が要る. 署名できなければ、タグも Zip も作らない
+  ${PROG} <slug> --yes
+      main / master 以外のブランチ(detached HEAD も)から作るときの確認(y/n/main)を飛ばして、そのまま作る.
+      端末から答えられないとき(パイプ・スクリプト)は、確認が出せないので、これが要る. --rebuild・--list とは使えない
   ${PROG} <slug> --dry-run
       確認だけ(Zip もタグも作らない)
   ${PROG} <slug> [--rebuild [<版>]] --dry-run --verify-content
@@ -695,6 +698,10 @@ ZIP_SCAN_FILE=""
 BUILT_ZIP=""
 # check_rebuild_digest の結果(--json の content_match 用): 1 = 一致 / 0 = 不一致 / 空 = 記録なし・比べられない.
 REBUILD_CONTENT_MATCH=""
+# 起動したときの引数(main の最初に取っておく). 「main」と答えて切り替えたあと、同じ引数でツールを起動し直すのに使う.
+ORIG_ARGS=()
+# 内部用の環境変数: 「main」の答えで切り替えて起動し直したとき、元のブランチ名を新しいプロセスへ渡す(最後の表示と、聞き直しの防止に使う).
+SWITCHED_FROM_VAR="WP_RELEASE_ZIP_MAKER_SWITCHED_FROM"
 # 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
 PART_FILE=""
 
@@ -1375,12 +1382,100 @@ verify_content_run() {
 	printf '\n[verify-content] 中身の確認はすべて通りました. 確認用の Zip は消しました(出力先には何も作っていません).\n'
 }
 
+# 標準入力から答えられるか(端末か). テスト用の環境変数 WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 があれば、端末と見なす
+# (自動テストは、答えをパイプで渡すため、端末ではない. README の「開発・テスト」に、テスト用であることを書く).
+stdin_is_terminal() {
+	[ "${WP_RELEASE_ZIP_MAKER_ASSUME_TTY:-0}" = "1" ] || [ -t 0 ]
+}
+
+# 「main」と答えたときの切り替え先になるブランチ(既定のブランチ)を標準出力へ出す. refs/heads/main があれば main、
+# 無くて refs/heads/master があれば master. どちらも無ければ何も出さず 1 を返す(両方あるときは main).
+# 今いるのが main / master のときは、この確認自体が出ない(cmd_build の case で対象外).
+default_branch() {
+	local b
+	for b in main master; do
+		if git -C "${GIT_TOP}" show-ref --verify --quiet "refs/heads/${b}"; then
+			printf '%s' "${b}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# main / master 以外のブランチ(detached HEAD も)から Zip とタグを作ってよいかを、端末で聞く(build のときだけ).
+# 事前の確認がすべて通ったあと・Zip を作る前に呼ぶ(y と答えたあとで別の理由で止まらないように).
+#   $1 = ブランチ名(detached HEAD は '(detached HEAD)') / $2 = 1 なら聞かずに進む(--yes)
+# 状態: --yes → 進む / 端末から答えられない(標準入力が端末でない)→ 止める(終了コード 1) /
+#       y・yes → 進む / n・no・空の Enter・入力の終わり(Ctrl-D)→ やめる(終了コード 1) /
+#       main(既定のブランチの名前. 既定のブランチがあるときだけ選べる)→ 切り替えて起動し直す(switch_to_default_and_restart) /
+#       それ以外 → もう一度聞く. 大文字小文字は区別しない.
+# 端末が無いときに止めるのは、確認を黙って飛ばすと、スクリプトや CI が誤ったブランチからリリースを作れてしまうため(--yes で明示的に通す).
+confirm_branch() {
+	local branch="$1" yes="$2" def="" ans options
+	[ "${yes}" -eq 0 ] || return 0
+	def="$(default_branch)" || def=""
+	if ! stdin_is_terminal; then
+		die "端末から答えられないので、止めます(${branch} から Zip とタグを作る確認が出せません). 続けるなら --yes を付けてください.${def:+ ${def} で作るなら、先に git switch ${def} してください.}"
+	fi
+	# 起動し直したあとでも main / master 以外なら、切り替えが効いていない. もう一度「main」を勧めると、切り替えを繰り返すので止める.
+	if [ -n "${!SWITCHED_FROM_VAR:-}" ]; then
+		die "${!SWITCHED_FROM_VAR} から切り替えて起動し直しましたが、まだ ${branch} です(切り替えが効いていません). ブランチを確かめてください."
+	fi
+	options="[y]es / [n]o"
+	[ -z "${def}" ] || options="${options} / ${def}(${def} に切り替えて作る)"
+	while :; do
+		printf 'このまま %s で Zip とタグを作りますか? %s: ' "${branch}" "${options}" >&2
+		# 入力の終わり(Ctrl-D)は、読めなかったこととして「やめる」にする.
+		IFS= read -r ans || ans=""
+		ans="$(printf '%s' "${ans}" | tr '[:upper:]' '[:lower:]')"
+		case "${ans}" in
+			y | yes) return 0 ;;
+			n | no | '')
+				err ""
+				err "${PROG}: やめました. Zip もタグも作っていません. ブランチは変えていません."
+				exit "${EXIT_STOP}"
+				;;
+			*)
+				# 既定のブランチの名前(main か master)が答えなら、切り替える. 既定のブランチが無ければ、選択肢に無いので、ここへ来ない.
+				if [ -n "${def}" ] && [ "${ans}" = "${def}" ]; then
+					switch_to_default_and_restart "${branch}" "${def}"
+				fi
+				err "  y か n${def:+ か ${def}} で答えてください."
+				;;
+		esac
+	done
+}
+
+# 「main」(既定のブランチ)と答えたとき: 今の HEAD が既定のブランチに入っていることを確かめ、切り替え、同じ引数でツールを起動し直す.
+#   $1 = 今のブランチ名 / $2 = 既定のブランチ名
+# 入っていなければ(マージされていなければ)切り替えずに止める(終了コード 1). 切り替えても、そのコミットは Zip に入らず、
+#   気づかないまま、マージ前の変更を含まないリリースを作ってしまうため.
+# 切り替えに失敗したら(未追跡のファイルがぶつかるなど)、Git のエラーを出して止める(ブランチは元のまま).
+# 起動し直す(exec)のは、版・check・タグの有無・Zip の名前を、すべて切り替えたあとの HEAD で確かめ直すため(切り替える前に読んだ値を使い回さない).
+#   起動し直したあとは、既定のブランチにいるので、もう聞かない(無限ループにならない). 元のブランチ名は環境変数で渡し、最後の表示に使う.
+switch_to_default_and_restart() {
+	local from="$1" def="$2" n out
+	if ! git -C "${GIT_TOP}" merge-base --is-ancestor HEAD "${def}" 2>/dev/null; then
+		n="$(git -C "${GIT_TOP}" rev-list --count "${def}..HEAD" 2>/dev/null)" || n="?"
+		die "${from} の ${n} 個のコミットが ${def} に入っていません. 切り替えても、それらは Zip に入りません. 先に ${def} へマージしてから実行してください. ブランチは変えていません."
+	fi
+	if ! out="$(git -C "${GIT_TOP}" switch "${def}" 2>&1)"; then
+		err "${out}"
+		die "${def} へ切り替えられませんでした(Git のエラーは上のとおり). ブランチは変えていません."
+	fi
+	err "${def} に切り替えました(HEAD $(git -C "${GIT_TOP}" rev-parse --short HEAD)). ${def} で改めて確かめます."
+	export "${SWITCHED_FROM_VAR}=${from}"
+	# ORIG_ARGS は、スラッグがあるので空にならない(bash 3.2 は、空の配列を set -u の下で展開すると落ちる).
+	exec "${BASH}" "$0" "${ORIG_ARGS[@]}"
+}
+
 # 3 つの動作の事前の確認と実行.
 #   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
 #   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
 #   $7 = 1 なら、署名付きのタグを打つ(--sign. 通常の実行だけ)
 #   $8 = 1 なら、--dry-run のあと Zip を一時ディレクトリに作って中身まで確かめ、消す(--verify-content. --dry-run のときだけ)
 #   $9 = JSON のレポートを作るパス(絶対パス. 空なら作らない. --json. --dry-run とは使えない)
+#   ${10} = 1 なら、main / master 以外のブランチからの確認を飛ばして進む(--yes. 通常の実行だけ)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1388,7 +1483,7 @@ verify_content_run() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" json_file="${9:-}" manifest_file=""
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" json_file="${9:-}" yes="${10:-0}" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1523,6 +1618,17 @@ cmd_build() {
 				;;
 			*) err "警告: ブランチは ${branch} です(main / master ではありません). リリースのタグを打つコミットか確かめてください." ;;
 		esac
+		# main / master 以外(detached HEAD を含む)からは、本番の実行では続けるかを聞く. --dry-run は聞かず、聞くことだけ添える(ブランチは変えない).
+		case "${branch}" in
+			main | master) ;;
+			*)
+				if [ "${dry}" -eq 1 ]; then
+					err "  [dry-run] 本番の実行では、このまま作るかを聞きます(y/n$(default_branch | sed 's#^#/#'). 端末から答えられなければ止まります. --yes で飛ばせます)."
+				else
+					confirm_branch "${branch}" "${yes}"
+				fi
+				;;
+		esac
 	fi
 	short="$(git -C "${GIT_TOP}" rev-parse --short "${ref}")"
 
@@ -1584,6 +1690,8 @@ cmd_build() {
 	print_zip_summary "${slug}" "${zip_file}"
 	printf '\nタグ:       %s を打ちました(注釈付き%s・コミット %s).\n' "${tag}" "$([ "${sign}" -eq 0 ] || printf '・署名付き')" "${short}"
 	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
+	# 「main」と答えて切り替えたときは、ブランチが元と違うことを、最後に添える(元のブランチには戻さない).
+	[ -z "${!SWITCHED_FROM_VAR:-}" ] || printf 'ブランチ:   %s に切り替えました(元は %s). 戻すなら: git switch %s\n' "${branch}" "${!SWITCHED_FROM_VAR}" "${!SWITCHED_FROM_VAR}"
 	finish_json_report "${json_file}" "${slug}" "${kind}" "${ver}" build "${tag}" "${ref}" "$([ "${branch}" = "(detached HEAD)" ] || printf '%s' "${branch}")" "${zip_file}" "$([ "${manifest}" -eq 1 ] && printf '%s' "${manifest_file}")" "${sign}" ""
 	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 	end_json_report
@@ -1808,6 +1916,8 @@ print_deploy_hint() {
 # --- 入口 ---------------------------------------------------------------------------------------
 
 main() {
+	# 起動したときの引数を取っておく(「main」と答えて切り替えたあと、同じ引数で起動し直すため).
+	ORIG_ARGS=("$@")
 	# 引数なしは使い方の誤り. 説明を標準エラーに出して終了する.
 	if [ "$#" -eq 0 ]; then
 		usage >&2
@@ -1831,7 +1941,7 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 verify_content=0 json_file=""
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 yes=0 verify_content=0 json_file=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
@@ -1840,6 +1950,7 @@ main() {
 			--allow-content-change) allow_change=1 ;;
 			--manifest) manifest=1 ;;
 			--sign) sign=1 ;;
+			--yes) yes=1 ;;
 			--verify-content) verify_content=1 ;;
 			--json)
 				# 値は次の引数. 無い・空・オプションの形('-' で始まる)なら使い方の誤り.
@@ -1875,7 +1986,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${verify_content}" -eq 1 ] || [ -n "${json_file}" ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${yes}" -eq 1 ] || [ "${verify_content}" -eq 1 ] || [ -n "${json_file}" ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1905,6 +2016,12 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
+	# --yes は、タグを打つ通常の実行の「main 以外のブランチからの確認」を飛ばすもの. --rebuild はブランチを確かめない(タグの時点から作る)ので、確認も無い.
+	if [ "${yes}" -eq 1 ] && [ "${rebuild}" -eq 1 ]; then
+		err "${PROG}: --yes は、タグを打つ通常の実行でだけ指定できます(--rebuild はタグの時点から作るので、ブランチの確認がありません)."
+		exit "${EXIT_USAGE}"
+	fi
+
 	# --verify-content は、--dry-run の確認を、Zip を作るところまで広げるもの. --dry-run が無ければ、本番の実行が Zip を作るので意味がない.
 	if [ "${verify_content}" -eq 1 ] && [ "${dry}" -eq 0 ]; then
 		err "${PROG}: --verify-content は --dry-run と一緒にだけ指定できます(Zip を一時ディレクトリに作って中身まで確かめ、消すためのものです)."
@@ -1917,7 +2034,7 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}" "${json_file}"
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}" "${json_file}" "${yes}"
 }
 
 main "$@"

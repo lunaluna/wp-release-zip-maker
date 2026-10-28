@@ -86,7 +86,8 @@ RC=0
 
 # ツールを、カレントディレクトリで実行する. 標準出力と標準エラーを OUT に、終了コードを RC に入れる.
 run_tool() {
-	OUT="$("${TOOL_BASH}" "${TOOL}" "$@" 2>&1)"
+	# 標準入力は閉じる(/dev/null). 端末で run.sh を流しても、ツールが標準入力を待たないように(main 以外のブランチの確認など).
+	OUT="$("${TOOL_BASH}" "${TOOL}" "$@" 2>&1 </dev/null)"
 	RC=$?
 }
 
@@ -99,7 +100,7 @@ run_tool_env() {
 	done
 	shift
 	# bash 3.2 は、空の配列を "${envs[@]}" と展開すると set -u で落ちる. ${envs[@]+...} の形で避ける.
-	OUT="$(env ${envs[@]+"${envs[@]}"} "${TOOL_BASH}" "${TOOL}" "$@" 2>&1)"
+	OUT="$(env ${envs[@]+"${envs[@]}"} "${TOOL_BASH}" "${TOOL}" "$@" 2>&1 </dev/null)"
 	RC=$?
 }
 

@@ -41,6 +41,17 @@ test_json_option_usage_errors() {
 	LABEL="--list"; run_tool --list --json r.json; assert_rc 2; assert_has "--list には"
 }
 
+# --yes は、タグを打つ通常の実行の確認を飛ばすもの. --rebuild・--list とは使えない(使い方の誤り). --dry-run とは使える.
+test_yes_option_usage_rules() {
+	run_tool --help; assert_has "--yes"
+	LABEL="--rebuild"; run_tool my-plugin --rebuild --yes; assert_rc 2; assert_has "--yes は、タグを打つ通常の実行でだけ"
+	LABEL="--list"; run_tool --list --yes; assert_rc 2; assert_has "--list には"
+	# 解釈は通る(そのあとの Git リポジトリの確認で止まる. 使い方の誤り = 終了コード 2 ではない).
+	cd "${TEST_ROOT}" || return 1
+	LABEL="単独"; run_tool my-plugin --yes; assert_rc 1; assert_has "Git リポジトリの中で実行してください"
+	LABEL="--dry-run と一緒"; run_tool my-plugin --yes --dry-run; assert_rc 1; assert_has "Git リポジトリの中で実行してください"
+}
+
 test_help_wins_over_other_arguments() {
 	run_tool --foo --help
 	assert_rc 0

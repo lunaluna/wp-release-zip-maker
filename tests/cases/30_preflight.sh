@@ -273,6 +273,8 @@ test_branch_other_than_main_warns() {
 	pf my-plugin --dry-run
 	assert_rc 0
 	assert_has "ブランチは work です"
+	assert_has "[dry-run] 本番の実行では、このまま作るかを聞きます"   # --dry-run は聞かず、聞くことだけ添える
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
 }
 
 test_detached_head_warns() {
@@ -281,6 +283,255 @@ test_detached_head_warns() {
 	pf my-plugin --dry-run
 	assert_rc 0
 	assert_has "detached HEAD"
+}
+
+# --- main 以外のブランチからの確認(build のときだけ. 端末で y/n を聞く) --------------------------------
+# 答えは、テスト用の環境変数 WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1(標準入力を端末と見なす)と、パイプで渡す.
+# 「進んだ」ことは、偽の wp が Zip を作ろうとして失敗した表示(wp dist-archive に失敗しました)で見分ける(確認のあとでだけ到達する).
+
+# 標準入力に答え($1. printf %b の形)を渡して、端末と見なして実行する. 以降の引数 = ツールの引数.
+pf_tty() {
+	local input="$1"
+	shift
+	OUT="$(printf '%b' "${input}" | env "WP_RELEASE_ZIP_MAKER_WP=${FAKE_WP}" WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 "${TOOL_BASH}" "${TOOL}" "$@" 2>&1)"
+	RC=$?
+}
+
+PROCEEDED="wp dist-archive に失敗しました"
+
+# 端末から答えられない(標準入力が端末でない)ときは止める. 何も作らない. --yes を案内し、main があれば git switch の案内も出す.
+test_branch_prompt_stops_without_a_terminal() {
+	pf_setup bp1
+	git switch -q -c work
+	LABEL="ブランチ"; pf my-plugin
+	assert_rc 1
+	assert_has "端末から答えられないので、止めます"
+	assert_has "--yes を付けてください"
+	assert_has "main で作るなら、先に git switch main してください"
+	assert_lacks "${PROCEEDED}"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+	git checkout -q --detach
+	LABEL="detached HEAD"; pf my-plugin
+	assert_rc 1
+	assert_has "端末から答えられないので、止めます((detached HEAD) から"
+}
+
+# --yes なら、確認を飛ばして進む(警告は出す).
+test_branch_prompt_is_skipped_with_yes() {
+	pf_setup bp2
+	git switch -q -c work
+	pf my-plugin --yes
+	assert_has "警告: ブランチは work です"
+	assert_has "${PROCEEDED}"
+	assert_lacks "端末から答えられない"
+	LABEL="--dry-run と一緒"; pf my-plugin --yes --dry-run
+	assert_rc 0
+	assert_has "[dry-run]"
+}
+
+# 端末で答える: y・yes(大文字小文字は区別しない)は進む.
+test_branch_prompt_yes_proceeds() {
+	pf_setup bp3
+	git switch -q -c work
+	local a
+	for a in 'y\n' 'yes\n' 'Y\n' 'YES\n'; do
+		LABEL="答え ${a}"; pf_tty "${a}" my-plugin
+		assert_has "このまま work で Zip とタグを作りますか? [y]es / [n]o / main(main に切り替えて作る): "
+		assert_has "${PROCEEDED}"
+	done
+}
+
+# n・no・空の Enter・入力の終わり(Ctrl-D)は、やめる(終了コード 1). 何も作らない・ブランチは変えない.
+test_branch_prompt_no_stops() {
+	pf_setup bp4
+	git switch -q -c work
+	local a
+	for a in 'n\n' 'no\n' 'N\n' '\n' ''; do
+		LABEL="答え '${a}'"; pf_tty "${a}" my-plugin
+		assert_rc 1
+		assert_has "やめました. Zip もタグも作っていません. ブランチは変えていません."
+		assert_lacks "${PROCEEDED}"
+		assert_no_file "${OUTD}"
+		assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+	done
+	assert_eq "" "$(git tag)" "作られたタグ"
+}
+
+# 変な答えは、もう一度聞く.
+test_branch_prompt_asks_again_on_a_strange_answer() {
+	pf_setup bp5
+	git switch -q -c work
+	LABEL="変な答えのあと n"; pf_tty 'maybe\nn\n' my-plugin
+	assert_rc 1
+	assert_has "y か n か main で答えてください"   # 既定のブランチ(main)があるので、main も選択肢に出る
+	assert_has "やめました"
+	LABEL="変な答えのあと y"; pf_tty 'maybe\ny\n' my-plugin
+	assert_has "y か n か main で答えてください"
+	assert_has "${PROCEEDED}"
+}
+
+# detached HEAD も聞く(ブランチ名の代わりに '(detached HEAD)').
+test_branch_prompt_for_detached_head() {
+	pf_setup bp6
+	git checkout -q --detach
+	pf_tty 'n\n' my-plugin
+	assert_rc 1
+	assert_has "このまま (detached HEAD) で Zip とタグを作りますか?"
+}
+
+# main・master では聞かない(端末なしでも止まらない). 今までどおり.
+test_branch_prompt_is_not_asked_on_main_or_master() {
+	pf_setup bp7
+	LABEL="main"; pf my-plugin
+	assert_has "${PROCEEDED}"
+	assert_lacks "端末から答えられない"
+	git branch -q -m main master
+	LABEL="master"; pf my-plugin
+	assert_has "${PROCEEDED}"
+	assert_lacks "端末から答えられない"
+}
+
+# 聞くのは、事前の確認がすべて通ったあと. ほかの理由で止まるなら、聞かずにその理由で止まる.
+test_branch_prompt_comes_after_the_other_checks() {
+	pf_setup bp8
+	git switch -q -c work
+	git tag -a my-plugin/1.2.3 -m existing
+	pf_tty 'y\n' my-plugin
+	assert_rc 1
+	assert_has "タグ my-plugin/1.2.3 はすでにあります"
+	assert_lacks "このまま work で"
+	LABEL="未コミットの変更"; git tag -d my-plugin/1.2.3 >/dev/null
+	echo changed >> "${P}/my main.php"
+	pf_tty 'y\n' my-plugin
+	assert_rc 1
+	assert_has "未コミット・未追跡の変更があります"
+	assert_lacks "このまま work で"
+}
+
+# --rebuild は、ブランチを確かめない(タグの時点から作る)ので、聞かない.
+test_branch_prompt_is_not_asked_for_rebuild() {
+	pf_setup bp9
+	git tag -a my-plugin/1.2.3 -m existing
+	git switch -q -c work
+	pf my-plugin --rebuild
+	assert_lacks "端末から答えられない"
+	assert_lacks "このまま work で"
+	assert_has "${PROCEEDED}"
+}
+
+# 既定のブランチ(main の答えの切り替え先): main があれば main・無くて master があれば master・どちらも無ければ案内しない.
+# 止めるときの案内で見分ける.
+test_default_branch_is_main_then_master() {
+	pf_setup bp10
+	git switch -q -c work
+	LABEL="main がある"; pf my-plugin
+	assert_has "main で作るなら、先に git switch main してください"
+	git branch -q -m main master
+	LABEL="master だけ"; pf my-plugin
+	assert_has "master で作るなら、先に git switch master してください"
+	git branch -q -m master trunk
+	LABEL="どちらも無い"; pf my-plugin
+	assert_rc 1
+	assert_has "続けるなら --yes を付けてください."
+	assert_lacks "git switch"
+	git branch -q -m trunk main
+	git branch -q master
+	LABEL="両方ある → main"; pf my-plugin
+	assert_has "main で作るなら、先に git switch main してください"
+}
+
+# 「main」の答え(既定のブランチへ切り替えて、同じ引数で起動し直す). 切り替えたあとの版は、切り替えたあとの HEAD で読み直す.
+
+# 選択肢の出し方: 既定のブランチがあれば「main(main に切り替えて作る)」を出し、無ければ出さない(master だけなら master).
+test_branch_prompt_options_follow_the_default_branch() {
+	pf_setup mb1
+	git switch -q -c work
+	LABEL="main がある"; pf_tty 'n\n' my-plugin
+	assert_has "[y]es / [n]o / main(main に切り替えて作る): "
+	git branch -q -m main master
+	LABEL="master だけ"; pf_tty 'n\n' my-plugin
+	assert_has "[y]es / [n]o / master(master に切り替えて作る): "
+	git branch -q -m master trunk
+	LABEL="どちらも無い"; pf_tty 'n\n' my-plugin
+	assert_has "このまま work で Zip とタグを作りますか? [y]es / [n]o: "
+	assert_lacks "に切り替えて作る"
+}
+
+# 選択肢に無い「main」は、変な答えと同じ(もう一度聞く). 切り替えない.
+test_branch_prompt_main_is_not_accepted_without_a_default_branch() {
+	pf_setup mb2
+	git switch -q -c work
+	git branch -q -m main trunk
+	pf_tty 'main\nn\n' my-plugin
+	assert_rc 1
+	assert_has "y か n で答えてください."
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+}
+
+# main に入っていないコミットがあれば、切り替えずに止める(ブランチは変わらない. 何も作らない).
+test_branch_prompt_main_stops_when_the_commits_are_not_merged() {
+	pf_setup mb3
+	git switch -q -c work
+	echo more >> "${P}/a-helper.php"
+	gcommit "work only"
+	echo again >> "${P}/a-helper.php"
+	gcommit "work only 2"
+	pf_tty 'main\n' my-plugin
+	assert_rc 1
+	assert_has "work の 2 個のコミットが main に入っていません"
+	assert_has "先に main へマージしてから実行してください. ブランチは変えていません."
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+	assert_lacks "に切り替えました"
+	assert_lacks "${PROCEEDED}"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+	LABEL="detached HEAD"; git checkout -q --detach
+	pf_tty 'main\n' my-plugin
+	assert_rc 1
+	assert_has "(detached HEAD) の 2 個のコミットが main に入っていません"
+}
+
+# main に入っていれば、切り替えて、同じ引数で起動し直し、切り替えたあとの HEAD で版を読み直す(main の版は 1.2.4・work の元の版は 1.2.3).
+# 起動し直したあとは聞かない. 切り替えたブランチは、そのまま残る.
+test_branch_prompt_main_switches_and_restarts_from_main() {
+	pf_setup mb4
+	git switch -q -c work
+	git switch -q main
+	bump_plugin 1.2.4        # main が先に進む(work は 1.2.3 の古いコミット = main に入っている)
+	git switch -q work
+	pf_tty 'main\n' my-plugin
+	assert_has "main に切り替えました(HEAD "
+	assert_has "main で改めて確かめます."
+	assert_has "を作ります: 版 1.2.4・HEAD "           # 切り替えたあとの版(切り替える前に読んだ 1.2.3 を使い回していない)
+	assert_lacks "版 1.2.3"
+	assert_has "${PROCEEDED}"
+	assert_eq 1 "$(printf '%s\n' "${OUT}" | grep -c '警告: ブランチは')" "警告の回数(切り替える前の 1 回だけ. 起動し直したあとは main なので出ない)"
+	assert_eq 1 "$(printf '%s\n' "${OUT}" | grep -c 'このまま work で')" "確認を出した回数(起動し直したあとは出さない)"
+	assert_eq "main" "$(git branch --show-current)" "ブランチ(main に切り替わったまま)"
+	assert_eq "" "$(git tag)" "作られたタグ(偽の wp で止まる)"
+}
+
+# 既定のブランチが master のときは、master と答える.
+test_branch_prompt_master_is_the_default_when_there_is_no_main() {
+	pf_setup mb5
+	git branch -q -m main master
+	git switch -q -c work
+	pf_tty 'master\n' my-plugin
+	assert_has "master に切り替えました(HEAD "
+	assert_has "${PROCEEDED}"
+	assert_eq "master" "$(git branch --show-current)" "ブランチ"
+}
+
+# 起動し直したあとも main / master 以外なら(切り替えが効いていない)、もう一度勧めずに止める. 内部の環境変数を直接渡して確かめる.
+test_branch_prompt_does_not_loop_after_a_restart() {
+	pf_setup mb6
+	git switch -q -c work
+	OUT="$(printf 'y\n' | env "WP_RELEASE_ZIP_MAKER_WP=${FAKE_WP}" WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 WP_RELEASE_ZIP_MAKER_SWITCHED_FROM=feature "${TOOL_BASH}" "${TOOL}" my-plugin 2>&1)"
+	RC=$?
+	assert_rc 1
+	assert_has "feature から切り替えて起動し直しましたが、まだ work です"
+	assert_lacks "このまま work で"
 }
 
 # --- コミット・コミッター --------------------------------------------------------------------------
