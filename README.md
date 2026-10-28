@@ -50,6 +50,11 @@ wp-release-zip-maker --version      # 版が出れば、PATH が通っていま�
 
 更新は、clone したディレクトリで `git pull` します。プロジェクトに置くのは、設定ファイル `.wp-release` と、各対象の `.distignore` だけです。
 
+- `main` は、リリースのときにだけ進みます(作業はブランチで進め、リリースのときに `main` へマージします)。`git pull` で取れるのは、いつも最新のリリースです
+- 新しい版が出たことを知るには、GitHub のリポジトリの **Watch → Custom → Releases** を選んでください。リリースのたびに GitHub の Release(1.1.0 から)を作るので、通知が届きます
+- 版を固定したいときは、タグを取り出します(`git -C ~/private/wp-release-zip-maker checkout 1.1.0`)。最新に戻すには `git checkout main` のあとで `git pull` します
+- フォークや Release からのダウンロードは要りません(更新を受け取りにくくなります)
+
 ## クイックスタート
 
 1. Git のルートに、設定ファイル `.wp-release` を置く(見本: [examples/](examples/))
@@ -214,7 +219,7 @@ my-plugin 1.2.3
 Zip: my-plugin.1.2.3.zip
 SHA-256: <配布した Zip そのもの(バイト列)の SHA-256>
 Content-SHA-256: <Zip の内容の指紋>
-Built-with: wp-release-zip-maker 1.0.1
+Built-with: wp-release-zip-maker 1.1.0
 WP-CLI: 2.12.0
 dist-archive: 3.1.0
 zip: 3.0
