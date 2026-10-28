@@ -3,7 +3,7 @@
 このファイルは [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) の形式に従います。
 版は素の版番号です(`v` を付けません)。
 
-## [Unreleased]
+## [1.3.0] - 2026-10-28
 
 ### Added
 

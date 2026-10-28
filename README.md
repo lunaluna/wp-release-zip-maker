@@ -52,7 +52,7 @@ wp-release-zip-maker --version      # 版が出れば、PATH が通っていま�
 
 - `main` は、リリースのときにだけ進みます(作業はブランチで進め、リリースのときに `main` へマージします)。`git pull` で取れるのは、いつも最新のリリースです
 - 新しい版が出たことを知るには、GitHub のリポジトリの **Watch → Custom → Releases** を選んでください。リリースのたびに GitHub の Release(1.1.0 から)を作るので、通知が届きます
-- 版を固定したいときは、タグを取り出します(`git -C ~/private/wp-release-zip-maker checkout 1.2.0`)。最新に戻すには `git checkout main` のあとで `git pull` します
+- 版を固定したいときは、タグを取り出します(`git -C ~/private/wp-release-zip-maker checkout 1.3.0`)。最新に戻すには `git checkout main` のあとで `git pull` します
 - フォークや Release からのダウンロードは要りません(更新を受け取りにくくなります)
 
 ## クイックスタート
@@ -180,7 +180,7 @@ build・`--rebuild` が成功したあと、指定したパスに JSON のファ
 
 ```json
 {
-  "tool_version": "1.2.0",
+  "tool_version": "1.3.0",
   "slug": "my-plugin",
   "kind": "plugin",
   "version": "1.2.3",
@@ -341,7 +341,7 @@ my-plugin 1.2.3
 Zip: my-plugin.1.2.3.zip
 SHA-256: <配布した Zip そのもの(バイト列)の SHA-256>
 Content-SHA-256: <Zip の内容の指紋>
-Built-with: wp-release-zip-maker 1.2.0
+Built-with: wp-release-zip-maker 1.3.0
 WP-CLI: 2.12.0
 dist-archive: 3.1.0
 zip: 3.0
