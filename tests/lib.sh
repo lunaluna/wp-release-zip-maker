@@ -183,16 +183,30 @@ have_dist_archive() {
 	command -v wp >/dev/null 2>&1 && wp dist-archive --help >/dev/null 2>&1 && command -v zip >/dev/null 2>&1 && command -v unzip >/dev/null 2>&1
 }
 
+# have_dist_archive の結果(空 = まだ調べていない / 1 = ある / 0 = 無い). need_real_wp が、ファイルごとに 1 回だけ調べて入れる.
+# 以前はテストごとに調べていて、wp dist-archive --help(1 回 0.16 秒)を 67 回呼んでいた(2026-10-28 の実測).
+# 1 つのケースファイルは 1 つのプロセスで流れ、その間に wp・zip・unzip の有無は変わらないので、使い回してよい.
+# (PATH を変えるテストは、1 つのコマンドの間だけ変えている. 60_deploy_hint の偽の unzip など)
+HAVE_REAL_WP=""
+
 # 実物の wp dist-archive が無ければ、そのテストを飛ばす(SKIP にする). 使い方(テストの先頭): need_real_wp || return 0
 # run.sh を --all なしで流したとき(WRZM_QUICK=1)も飛ばす. 全部を流すと約 5 分かかるため(時間の大半が、これらのテスト).
 # 飛ばしたテストの名前を WRZM_QUICK_LOG に書き、run.sh が最後に件数を数えて表示する.
+# テストの関数は、tests_main からサブシェルを作らずに呼ばれるので、HAVE_REAL_WP への代入は次のテストにも残る.
 need_real_wp() {
 	if [ "${WRZM_QUICK:-0}" = "1" ]; then
 		skip "実物の WP-CLI が要る. すべてを流すなら tests/run.sh --all"
 		[ -z "${WRZM_QUICK_LOG:-}" ] || printf '%s\n' "${CUR_NAME}" >>"${WRZM_QUICK_LOG}"
 		return 1
 	fi
-	if have_dist_archive; then
+	if [ -z "${HAVE_REAL_WP}" ]; then
+		if have_dist_archive; then
+			HAVE_REAL_WP=1
+		else
+			HAVE_REAL_WP=0
+		fi
+	fi
+	if [ "${HAVE_REAL_WP}" = "1" ]; then
 		return 0
 	fi
 	skip "実物の wp dist-archive・zip・unzip が無い"
