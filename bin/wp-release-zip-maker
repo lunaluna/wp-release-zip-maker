@@ -1378,12 +1378,63 @@ verify_content_run() {
 	printf '\n[verify-content] 中身の確認はすべて通りました. 確認用の Zip は消しました(出力先には何も作っていません).\n'
 }
 
+# 標準入力から答えられるか(端末か). テスト用の環境変数 WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 があれば、端末と見なす
+# (自動テストは、答えをパイプで渡すため、端末ではない. README の「開発・テスト」に、テスト用であることを書く).
+stdin_is_terminal() {
+	[ "${WP_RELEASE_ZIP_MAKER_ASSUME_TTY:-0}" = "1" ] || [ -t 0 ]
+}
+
+# 「main」と答えたときの切り替え先になるブランチ(既定のブランチ)を標準出力へ出す. refs/heads/main があれば main、
+# 無くて refs/heads/master があれば master. どちらも無ければ何も出さず 1 を返す(両方あるときは main).
+# 今いるのが main / master のときは、この確認自体が出ない(cmd_build の case で対象外).
+default_branch() {
+	local b
+	for b in main master; do
+		if git -C "${GIT_TOP}" show-ref --verify --quiet "refs/heads/${b}"; then
+			printf '%s' "${b}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# main / master 以外のブランチ(detached HEAD も)から Zip とタグを作ってよいかを、端末で聞く(build のときだけ).
+# 事前の確認がすべて通ったあと・Zip を作る前に呼ぶ(y と答えたあとで別の理由で止まらないように).
+#   $1 = ブランチ名(detached HEAD は '(detached HEAD)') / $2 = 1 なら聞かずに進む(--yes)
+# 状態: --yes → 進む / 端末から答えられない(標準入力が端末でない)→ 止める(終了コード 1) /
+#       y・yes → 進む / n・no・空の Enter・入力の終わり(Ctrl-D)→ やめる(終了コード 1) / それ以外 → もう一度聞く. 大文字小文字は区別しない.
+# 端末が無いときに止めるのは、確認を黙って飛ばすと、スクリプトや CI が誤ったブランチからリリースを作れてしまうため(--yes で明示的に通す).
+confirm_branch() {
+	local branch="$1" yes="$2" def ans
+	[ "${yes}" -eq 0 ] || return 0
+	if ! stdin_is_terminal; then
+		def="$(default_branch)" || def=""
+		die "端末から答えられないので、止めます(${branch} から Zip とタグを作る確認が出せません). 続けるなら --yes を付けてください.${def:+ ${def} で作るなら、先に git switch ${def} してください.}"
+	fi
+	while :; do
+		printf 'このまま %s で Zip とタグを作りますか? [y]es / [n]o: ' "${branch}" >&2
+		# 入力の終わり(Ctrl-D)は、読めなかったこととして「やめる」にする.
+		IFS= read -r ans || ans=""
+		ans="$(printf '%s' "${ans}" | tr '[:upper:]' '[:lower:]')"
+		case "${ans}" in
+			y | yes) return 0 ;;
+			n | no | '')
+				err ""
+				err "${PROG}: やめました. Zip もタグも作っていません. ブランチは変えていません."
+				exit "${EXIT_STOP}"
+				;;
+			*) err "  y か n で答えてください." ;;
+		esac
+	done
+}
+
 # 3 つの動作の事前の確認と実行.
 #   $1 = スラッグ / $2 = dry-run(1 = 確認だけ) / $3 = rebuild(1 = 既存のタグから作り直す) / $4 = --rebuild で指定された版(空ならなし)
 #   $5 = 1 なら、内容の不一致でも続ける(--allow-content-change) / $6 = 1 なら、マニフェストも作る(--manifest)
 #   $7 = 1 なら、署名付きのタグを打つ(--sign. 通常の実行だけ)
 #   $8 = 1 なら、--dry-run のあと Zip を一時ディレクトリに作って中身まで確かめ、消す(--verify-content. --dry-run のときだけ)
 #   $9 = JSON のレポートを作るパス(絶対パス. 空なら作らない. --json. --dry-run とは使えない)
+#   ${10} = 1 なら、main / master 以外のブランチからの確認を飛ばして進む(--yes. 通常の実行だけ)
 #
 # build: HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない). 作業ツリーがきれいなこと・タグも Zip も無いことが要る.
 # rebuild: 既存のタグの時点の内容から Zip だけを作り直す(タグは打たない). 作業ツリーの状態は問わない.
@@ -1391,7 +1442,7 @@ verify_content_run() {
 # 確かめる順: 道具 → HEAD の有無 → ref(HEAD またはタグ)の対象と .distignore → 作業ツリー(build だけ)→
 #   版と check → タグ → 出力先の Zip.
 cmd_build() {
-	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" json_file="${9:-}" manifest_file=""
+	local slug="$1" dry="$2" rebuild="$3" want_ver="$4" allow_change="$5" manifest="$6" sign="$7" verify_content="${8:-0}" json_file="${9:-}" yes="${10:-0}" manifest_file=""
 	local kind path tp ref refdesc head_sha ver tver vname vrel tag out zip_file branch short
 
 	load_config
@@ -1525,6 +1576,17 @@ cmd_build() {
 				branch="(detached HEAD)"
 				;;
 			*) err "警告: ブランチは ${branch} です(main / master ではありません). リリースのタグを打つコミットか確かめてください." ;;
+		esac
+		# main / master 以外(detached HEAD を含む)からは、本番の実行では続けるかを聞く. --dry-run は聞かず、聞くことだけ添える(ブランチは変えない).
+		case "${branch}" in
+			main | master) ;;
+			*)
+				if [ "${dry}" -eq 1 ]; then
+					err "  [dry-run] 本番の実行では、このまま作るかを聞きます(端末から答えられなければ止まります. --yes で飛ばせます)."
+				else
+					confirm_branch "${branch}" "${yes}"
+				fi
+				;;
 		esac
 	fi
 	short="$(git -C "${GIT_TOP}" rev-parse --short "${ref}")"
@@ -1927,7 +1989,7 @@ main() {
 		exit "${EXIT_USAGE}"
 	fi
 
-	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}" "${json_file}"
+	cmd_build "${slug}" "${dry}" "${rebuild}" "${version}" "${allow_change}" "${manifest}" "${sign}" "${verify_content}" "${json_file}" "${yes}"
 }
 
 main "$@"
