@@ -321,6 +321,7 @@ tests_main() {
 		fi
 	done
 	cd "${TEST_ROOT}" || exit 1
-	printf -- '--- %s: ok %s / FAIL %s / SKIP %s\n' "$(basename "$0")" "${N_PASS}" "${N_FAIL}" "${N_SKIP}"
+	# かかった秒数も出す(SECONDS は、このファイルのプロセスが始まってからの秒数). README・run.sh の目安を直すときの根拠にする.
+	printf -- '--- %s: ok %s / FAIL %s / SKIP %s(%s 秒)\n' "$(basename "$0")" "${N_PASS}" "${N_FAIL}" "${N_SKIP}" "${SECONDS}"
 	[ "${N_FAIL}" -eq 0 ]
 }
