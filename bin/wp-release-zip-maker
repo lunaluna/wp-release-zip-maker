@@ -73,6 +73,9 @@ Zip の作成は WP-CLI の 'wp dist-archive' に任せる.
       HEAD の内容から Zip を作り、注釈付きタグを打つ(push はしない)
   ${PROG} <slug> --sign
       署名付きのタグ(git tag -s)を打つ. gpg と鍵が要る. 署名できなければ、タグも Zip も作らない
+  ${PROG} <slug> --yes
+      main / master 以外のブランチ(detached HEAD も)から作るときの確認(y/n/main)を飛ばして、そのまま作る.
+      端末から答えられないとき(パイプ・スクリプト)は、確認が出せないので、これが要る. --rebuild・--list とは使えない
   ${PROG} <slug> --dry-run
       確認だけ(Zip もタグも作らない)
   ${PROG} <slug> [--rebuild [<版>]] --dry-run --verify-content
@@ -1831,7 +1834,7 @@ main() {
 
 	# 残りの引数を解釈する. --dry-run と --rebuild は組み合わせられる(--rebuild --dry-run = 作り直しの確認だけ).
 	# 位置引数は、1 つ目 = スラッグ・2 つ目 = 版(--rebuild のときだけ).
-	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 verify_content=0 json_file=""
+	local slug="" version="" want_list=0 dry=0 rebuild=0 allow_change=0 manifest=0 sign=0 yes=0 verify_content=0 json_file=""
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
 			--list) want_list=1 ;;
@@ -1840,6 +1843,7 @@ main() {
 			--allow-content-change) allow_change=1 ;;
 			--manifest) manifest=1 ;;
 			--sign) sign=1 ;;
+			--yes) yes=1 ;;
 			--verify-content) verify_content=1 ;;
 			--json)
 				# 値は次の引数. 無い・空・オプションの形('-' で始まる)なら使い方の誤り.
@@ -1875,7 +1879,7 @@ main() {
 
 	# --list は、スラッグも他のオプションも取らない.
 	if [ "${want_list}" -eq 1 ]; then
-		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${verify_content}" -eq 1 ] || [ -n "${json_file}" ]; then
+		if [ -n "${slug}" ] || [ "${dry}" -eq 1 ] || [ "${rebuild}" -eq 1 ] || [ "${allow_change}" -eq 1 ] || [ "${manifest}" -eq 1 ] || [ "${sign}" -eq 1 ] || [ "${yes}" -eq 1 ] || [ "${verify_content}" -eq 1 ] || [ -n "${json_file}" ]; then
 			err "${PROG}: --list には、スラッグも他のオプションも付けられません."
 			exit "${EXIT_USAGE}"
 		fi
@@ -1902,6 +1906,12 @@ main() {
 	# 署名するのは、タグを打つ通常の実行だけ. --rebuild はタグを打たない.
 	if [ "${sign}" -eq 1 ] && [ "${rebuild}" -eq 1 ]; then
 		err "${PROG}: --sign は、タグを打つ通常の実行でだけ指定できます(--rebuild はタグを打ちません)."
+		exit "${EXIT_USAGE}"
+	fi
+
+	# --yes は、タグを打つ通常の実行の「main 以外のブランチからの確認」を飛ばすもの. --rebuild はブランチを確かめない(タグの時点から作る)ので、確認も無い.
+	if [ "${yes}" -eq 1 ] && [ "${rebuild}" -eq 1 ]; then
+		err "${PROG}: --yes は、タグを打つ通常の実行でだけ指定できます(--rebuild はタグの時点から作るので、ブランチの確認がありません)."
 		exit "${EXIT_USAGE}"
 	fi
 
