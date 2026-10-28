@@ -551,10 +551,14 @@ find_target() {
 	die "スラッグ '${slug}' は ${CONFIG_NAME} にありません. 設定にあるスラッグ:${known}"
 }
 
-# Zip の作成に要る道具(zip コマンド・WP-CLI・wp dist-archive)があるかを確かめる. 無ければ入れ方を示して止める.
+# Zip の作成に要る道具(zip・unzip コマンド・WP-CLI・wp dist-archive)があるかを確かめる. 無ければ入れ方を示して止める.
+# unzip は必須: Zip の中身の検査(スラッグのフォルダー・配布してはいけないファイル・外へ出る名前)と内容の指紋に使う.
+# 1.1.0 までは、無ければ警告して検査を省き、タグまで作った. 検査を省いたまま配布物ができるのを避けるため、止める(2026-10-28 のレビュー).
 check_tools() {
 	command -v zip >/dev/null 2>&1 ||
 		die "zip コマンドが見つかりません. wp dist-archive が Zip を作るときに使います(macOS は標準. Linux は zip パッケージを入れてください)."
+	command -v unzip >/dev/null 2>&1 ||
+		die "unzip コマンドが見つかりません. 作った Zip の中身の検査(スラッグのフォルダー・配布してはいけないファイル・外へ出る名前)と、内容の指紋に使います(macOS は標準. Debian 系は apt install unzip)."
 	command -v "${WP_BIN}" >/dev/null 2>&1 ||
 		die "WP-CLI(${WP_BIN})が見つかりません. 入れ方: https://wp-cli.org/ (macOS の Homebrew: brew install wp-cli)"
 	# 登録されたコマンドなら --help は 0 で終わり、未登録なら 1 で終わる(WP-CLI 2.12.0 で確認).
@@ -683,6 +687,7 @@ sha256_files_stdin() {
 }
 
 # Zip の中身を一時ディレクトリへ展開し、内容を表す行を並べ替えて標準出力へ出す(内容の指紋とマニフェストの元になるデータ). 展開できない・ファイルが 1 つも無ければ、何も出さず 1 を返す.
+# unzip の有無は check_tools が確かめ済み(無ければ、ここへ来る前に止まる).
 #   F <内容の SHA-256> ./<パス>   通常のファイル(内容そのものを SHA-256 にする)
 #   X ./<パス>                    実行権限(所有者)があるファイル
 #   L ./<パス> -> <リンク先>      シンボリックリンク
@@ -690,7 +695,6 @@ sha256_files_stdin() {
 # 展開先は TMP_WORK の下に作る(make_zip が作り、終了時に cleanup_tmp が消す. 途中で中断されても取り残さない). パスの ASCII 以外のバイトは、そのまま扱う(LC_ALL=C).
 zip_scan() {
 	local dir lines
-	command -v unzip >/dev/null 2>&1 || return 1
 	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || return 1
 	dir="$(mktemp -d "${TMP_WORK}/digest.XXXXXX")" || return 1
 	if ! unzip -qq "$1" -d "${dir}" </dev/null >/dev/null 2>&1; then
@@ -711,7 +715,7 @@ zip_scan() {
 	printf '%s\n' "${lines}"
 }
 
-# Zip の「内容の指紋」を標準出力へ出す. unzip が無い・展開できない・ファイルが無ければ、何も出さず 1 を返す.
+# Zip の「内容の指紋」を標準出力へ出す. 展開できない・ファイルが無ければ、何も出さず 1 を返す.
 # zip_scan の行(ファイルの内容・実行権限・リンク先を含み、時刻・属性・圧縮のしかたを含まない)を SHA-256 にしたもの.
 # 以前は unzip -v の CRC-32 と名前から作っていた. CRC-32 は、同じ値になる別の内容を意図的に作れるので、同じ内容かどうかの根拠にならない(2026-10-26 のレビュー).
 # Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため. 2026-10-26 に確認). 内容が同じかどうかは、この指紋で比べる.
@@ -731,7 +735,7 @@ zip_manifest() {
 	printf '%s\n' "${scan}" | LC_ALL=C sed -n 's/^F \([0-9a-f]\{64\}\) \.\//\1  /p'
 }
 
-# Zip のマニフェストを作って、出力先へ上書きせずに置き、場所とファイル数を表示する. 作れなければ(unzip が無い・展開できない)非 0 を返す.
+# Zip のマニフェストを作って、出力先へ上書きせずに置き、場所とファイル数を表示する. 作れなければ(展開できない)非 0 を返す.
 #   $1 = Zip のパス / $2 = マニフェストの最終のパス
 write_manifest() {
 	local zip_file="$1" dest="$2" tmp n
@@ -851,14 +855,10 @@ warn_non_ascii_names() {
 	fi
 }
 
-# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること・配布してはいけないファイルが無いこと. unzip が無ければ確認を省く.
+# 作った Zip の中身を確かめる: 全部がスラッグのフォルダーの下にあること・配布してはいけないファイルが無いこと.
 #   $1 = スラッグ / $2 = Zip のパス / $3 = 種類(plugin・theme・dir)
 verify_zip() {
 	local slug="$1" zip_file="$2" kind="$3" found stops warns n escapes
-	if ! command -v unzip >/dev/null 2>&1; then
-		err "警告: unzip が無いので、Zip の中身の確認(スラッグのフォルダー・配布してはいけないファイルの検査)を省きました. 中身を自分で確かめてから使ってください."
-		return 0
-	fi
 	# スラッグに正規表現の記号(ドット)があっても安全なよう、awk の index() で前方一致を見る.
 	# LC_ALL=C: ファイル名に ASCII 以外が入ると、ロケールによっては awk・sort が不正なバイト列で落ちるため.
 	if ! unzip -Z1 "${zip_file}" | LC_ALL=C awk -v s="${slug}/" 'index($0, s) != 1 { bad = 1 } END { exit bad ? 1 : 0 }'; then
@@ -954,14 +954,12 @@ print_zip_summary() {
 	printf 'Zip:        %s\n' "${zip_file}"
 	printf 'サイズ:     %s (%s バイト)\n' "$(human_size "${bytes}")" "${bytes}"
 	printf 'SHA-256:    %s\n' "$(sha256_of "${zip_file}")"
-	if command -v unzip >/dev/null 2>&1; then
-		printf '中身:       %s\n' "$(unzip -Zt "${zip_file}" | sed 's/^[[:space:]]*//')"
-		printf '\n%s/ の直下(ファイル数 名前):\n' "${slug}"
-		# 一番上のフォルダーの直下の名前ごとに、ファイル数を数える(末尾が '/' のディレクトリのエントリは数えない).
-		# LC_ALL=C: ASCII 以外のファイル名でも落ちないように. macOS の unzip は、ASCII 以外のバイトの一部を '?' に置き換え、
-		# 残りは不正な UTF-8 のまま出す. 端末を崩さないよう、印字できないバイトを '?' にそろえてから数える.
-		unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '$0 !~ /\/$/ && NF >= 2 && $2 != "" { c[$2]++ } END { for (k in c) printf "  %5d  %s\n", c[k], k }' | LC_ALL=C sort -k2 | head -n 40
-	fi
+	printf '中身:       %s\n' "$(unzip -Zt "${zip_file}" | sed 's/^[[:space:]]*//')"
+	printf '\n%s/ の直下(ファイル数 名前):\n' "${slug}"
+	# 一番上のフォルダーの直下の名前ごとに、ファイル数を数える(末尾が '/' のディレクトリのエントリは数えない).
+	# LC_ALL=C: ASCII 以外のファイル名でも落ちないように. macOS の unzip は、ASCII 以外のバイトの一部を '?' に置き換え、
+	# 残りは不正な UTF-8 のまま出す. 端末を崩さないよう、印字できないバイトを '?' にそろえてから数える.
+	unzip -Z1 "${zip_file}" | LC_ALL=C tr -c '[:print:]\n' '?' | LC_ALL=C awk -F/ '$0 !~ /\/$/ && NF >= 2 && $2 != "" { c[$2]++ } END { for (k in c) printf "  %5d  %s\n", c[k], k }' | LC_ALL=C sort -k2 | head -n 40
 }
 
 # --- タグ ---------------------------------------------------------------------------------------
@@ -1050,14 +1048,18 @@ check_git_identity() {
 # メッセージ: 1 行目 = '<スラッグ> <版>'. 本文 = Zip の名前・SHA-256・内容の指紋・ツールの版・Zip を作った道具(WP-CLI・dist-archive・zip)の版.
 #   SHA-256         = 配布した Zip そのもの(バイト列)の SHA-256. 手元の Zip が配布したものと同じかを確かめるための記録.
 #   Content-SHA-256 = Zip の内容の指紋(zip_content_digest). --rebuild が、作り直した Zip の内容と比べる.
-#                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. unzip が無ければこの行は書かない.
+#                     Zip 全体の SHA-256 は作り直すたびに変わるので、比べるのはこちら. 必ず書く(展開できなければタグを打たずに止める).
 create_tag() {
 	local tag="$1" commit="$2" slug="$3" ver="$4" zip_file="$5" sign="${6:-0}" content tagopt="-a"
 	[ "${sign}" -eq 0 ] || tagopt="-s"
 	content="$(zip_content_digest "${zip_file}")" || content=""
+	if [ -z "${content}" ]; then
+		err "${PROG}: Zip を展開できず、内容の指紋を作れません(指紋のないタグは打ちません)."
+		return 1
+	fi
 	{
 		printf '%s %s\n\nZip: %s\nSHA-256: %s\n' "${slug}" "${ver}" "$(basename "${zip_file}")" "$(sha256_of "${zip_file}")"
-		[ -z "${content}" ] || printf 'Content-SHA-256: %s\n' "${content}"
+		printf 'Content-SHA-256: %s\n' "${content}"
 		printf 'Built-with: %s %s\n' "${PROG}" "${WP_RELEASE_ZIP_MAKER_VERSION}"
 		printf 'WP-CLI: %s\n' "$(wp_cli_version)"
 		printf 'dist-archive: %s\n' "$(dist_archive_version)"
@@ -1298,7 +1300,7 @@ cmd_build() {
 	# タグを打てなければ、Zip も消す(「タグの無い Zip」を残すと、次回の実行が止まるため).
 	# マニフェストは、タグより先に作る(作れなければ、タグを打たずに Zip も消す). タグを打てなければ、マニフェストも消す.
 	if [ "${manifest}" -eq 1 ]; then
-		write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました). unzip があるか確かめてください."; }
+		write_manifest "${zip_file}" "${manifest_file}" || { rm -f -- "${zip_file}"; die "マニフェストを作れませんでした(Zip は消しました). Zip を展開できるか確かめてください."; }
 	fi
 	if ! create_tag "${tag}" "${ref}" "${slug}" "${ver}" "${zip_file}" "${sign}"; then
 		rm -f -- "${zip_file}"
@@ -1345,7 +1347,7 @@ print_tool_version_comparison() {
 # 一致しなくてよい. 配布済みの Zip と同じか確かめたいときは、その Zip の SHA-256 を、タグに記録された SHA-256 と比べる.
 # 止める理由: 同じタグから作ったのに内容が違うのは、.distignore・zip・wp dist-archive の版などが変わって、配布する中身が変わっている状態.
 #             警告だけで手順の表示まで進むと、そのままアップロードされてしまう(2026-10-26 のレビュー). 意図した差なら --allow-content-change で続ける.
-# 止めないとき: 指紋が一致・タグに記録がない(古いタグ・軽量タグ)・指紋を計算できない(unzip が無い)は、比べようがないので警告だけ.
+# 止めないとき: 指紋が一致・タグに記録がない(古いタグ・軽量タグ)・指紋を計算できない(Zip を展開できない)は、比べようがないので警告だけ.
 #   $1 = タグ名 / $2 = 作り直した Zip のパス / $3 = 1 なら、不一致でも続ける(--allow-content-change)
 check_rebuild_digest() {
 	local tag="$1" zip_file="$2" allow="$3" now recorded mismatch=0
@@ -1353,7 +1355,7 @@ check_rebuild_digest() {
 	now="$(zip_content_digest "${zip_file}")" || now=""
 	printf '\nタグとの比較:\n'
 	if [ -z "${now}" ]; then
-		printf '  Zip の内容の指紋を計算できませんでした(unzip が無い?). 中身(上の内訳)を目で確かめてください.\n'
+		printf '  Zip を展開できず、内容の指紋を計算できませんでした. 中身(上の内訳)を目で確かめてください.\n'
 	elif [ -z "${recorded}" ]; then
 		printf '  タグ %s に、内容の指紋(Content-SHA-256)の記録がありません(古いタグ、または別の方法で打ったタグ). 中身(上の内訳)を目で確かめてください.\n' "${tag}"
 	elif [ "${recorded}" = "${now}" ]; then
@@ -1451,7 +1453,7 @@ print_deploy_hint() {
 	name="${slug}.${ver}"
 	# Zip に VERSION が入っているか(サーバーで版を確かめる行を出せるか).
 	has_version=0
-	if command -v unzip >/dev/null 2>&1 && unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/VERSION"; then
+	if unzip -Z1 "${zip_file}" | grep -qx -- "${slug}/VERSION"; then
 		has_version=1
 	fi
 
