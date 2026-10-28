@@ -644,6 +644,9 @@ check_version_files() {
 
 # 一時ディレクトリ(make_zip が作る). 終了時に必ず消す.
 TMP_WORK=""
+# make_zip が、作った Zip を 1 回だけ展開して走査した結果(zip_scan の行)を書くファイル. TMP_WORK の中にある.
+# 内容の指紋(タグ・--rebuild の比較)とマニフェストは、このファイルを読む(同じ走査の結果なので食い違わず、展開も 1 回で済む).
+ZIP_SCAN_FILE=""
 # 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
 PART_FILE=""
 
@@ -715,24 +718,22 @@ zip_scan() {
 	printf '%s\n' "${lines}"
 }
 
-# Zip の「内容の指紋」を標準出力へ出す. 展開できない・ファイルが無ければ、何も出さず 1 を返す.
+# Zip の「内容の指紋」を標準出力へ出す. make_zip が作った走査の結果(ZIP_SCAN_FILE)が無ければ、何も出さず 1 を返す.
 # zip_scan の行(ファイルの内容・実行権限・リンク先を含み、時刻・属性・圧縮のしかたを含まない)を SHA-256 にしたもの.
 # 以前は unzip -v の CRC-32 と名前から作っていた. CRC-32 は、同じ値になる別の内容を意図的に作れるので、同じ内容かどうかの根拠にならない(2026-10-26 のレビュー).
 # Zip 全体の SHA-256 は、同じコミットから作り直しても毎回変わる(zip が時刻などの属性を入れるため. 2026-10-26 に確認). 内容が同じかどうかは、この指紋で比べる.
 zip_content_digest() {
-	local scan
-	scan="$(zip_scan "$1")" || return 1
-	printf '%s\n' "${scan}" | sha256_stdin
+	[ -n "${ZIP_SCAN_FILE}" ] && [ -s "${ZIP_SCAN_FILE}" ] || return 1
+	sha256_stdin <"${ZIP_SCAN_FILE}"
 }
 
-# Zip のマニフェスト(ファイルごとの "<SHA-256>  <Zip の一番上のフォルダーからのパス>")を標準出力へ出す. zip_scan が出せなければ、何も出さず 1 を返す.
-# 内容の指紋と同じデータ(zip_scan の F の行)から作るので、両者は食い違わない. 形は shasum -a 256 -c が読める('  ' の 2 つの空白).
+# Zip のマニフェスト(ファイルごとの "<SHA-256>  <Zip の一番上のフォルダーからのパス>")を標準出力へ出す. 走査の結果(ZIP_SCAN_FILE)が無ければ、何も出さず 1 を返す.
+# 内容の指紋と同じファイル(ZIP_SCAN_FILE の F の行)から作るので、両者は食い違わない. 形は shasum -a 256 -c が読める('  ' の 2 つの空白).
 # 展開した Zip のディレクトリで `shasum -a 256 -c <マニフェスト>` を実行すれば、中身が同じかを照合できる.
 # 実行権限とシンボリックリンクは載せない(内容の指紋には入っている).
 zip_manifest() {
-	local scan
-	scan="$(zip_scan "$1")" || return 1
-	printf '%s\n' "${scan}" | LC_ALL=C sed -n 's/^F \([0-9a-f]\{64\}\) \.\//\1  /p'
+	[ -n "${ZIP_SCAN_FILE}" ] && [ -s "${ZIP_SCAN_FILE}" ] || return 1
+	LC_ALL=C sed -n 's/^F \([0-9a-f]\{64\}\) \.\//\1  /p' "${ZIP_SCAN_FILE}"
 }
 
 # Zip のマニフェストを作って、出力先へ上書きせずに置き、場所とファイル数を表示する. 作れなければ(展開できない)非 0 を返す.
@@ -741,7 +742,7 @@ write_manifest() {
 	local zip_file="$1" dest="$2" tmp n
 	[ -n "${TMP_WORK}" ] && [ -d "${TMP_WORK}" ] || return 1
 	tmp="${TMP_WORK}/manifest.txt"
-	zip_manifest "${zip_file}" >"${tmp}" || return 1
+	zip_manifest >"${tmp}" || return 1
 	[ -s "${tmp}" ] || return 1
 	n="$(wc -l <"${tmp}")"
 	n=$((n))
@@ -805,6 +806,10 @@ ${wp_out}"
 
 	verify_zip "${slug}" "${built}" "${kind}"
 	warn_non_ascii_names "${dest}"
+	# 中身の走査(展開とハッシュ)は、ここで 1 回だけ行う. 以降の指紋・マニフェストはこの結果を読む.
+	# 置く前(publish_zip の前)に行うので、展開できなければ、最終のパスに Zip を残さずに止まる.
+	ZIP_SCAN_FILE="${TMP_WORK}/scan.txt"
+	zip_scan "${built}" >"${ZIP_SCAN_FILE}" || die "Zip を展開できず、中身を走査できませんでした(内容の指紋を作れないので、Zip は作りません)."
 	publish_zip "${built}" "${zip_file}"
 }
 
@@ -1052,7 +1057,7 @@ check_git_identity() {
 create_tag() {
 	local tag="$1" commit="$2" slug="$3" ver="$4" zip_file="$5" sign="${6:-0}" content tagopt="-a"
 	[ "${sign}" -eq 0 ] || tagopt="-s"
-	content="$(zip_content_digest "${zip_file}")" || content=""
+	content="$(zip_content_digest)" || content=""
 	if [ -z "${content}" ]; then
 		err "${PROG}: Zip を展開できず、内容の指紋を作れません(指紋のないタグは打ちません)."
 		return 1
@@ -1352,7 +1357,7 @@ print_tool_version_comparison() {
 check_rebuild_digest() {
 	local tag="$1" zip_file="$2" allow="$3" now recorded mismatch=0
 	recorded="$(tag_recorded_field "${tag}" "Content-SHA-256")"
-	now="$(zip_content_digest "${zip_file}")" || now=""
+	now="$(zip_content_digest)" || now=""
 	printf '\nタグとの比較:\n'
 	if [ -z "${now}" ]; then
 		printf '  Zip を展開できず、内容の指紋を計算できませんでした. 中身(上の内訳)を目で確かめてください.\n'

@@ -290,6 +290,31 @@ test_manifest_lists_every_file_with_its_sha256() {
 	(cd "${x}" && shasum -a 256 -c "${mf}" >/dev/null 2>&1) && fail "改ざんしたのに、照合が通りました"
 }
 
+# Zip の展開(unzip -d)は、build でも --rebuild でも、--manifest を付けても 1 回だけであること(1.1.0 までは、指紋とマニフェストで別々に展開した).
+# 指紋とマニフェストは同じ走査の結果から作る(マニフェストの各行の中身の一致は、上のテストが shasum -c で確かめる).
+# 展開の回数は、unzip の前に置いた記録用のラッパーで数える(展開する呼び出しは -d を持つ. 一覧の -Z1・-Zt・-p は数えない).
+test_zip_is_extracted_only_once() {
+	need_real_wp || return 0
+	local wrap="${TEST_ROOT}/unzip-wrap" log="${TEST_ROOT}/unzip-calls.log" real
+	real="$(command -v unzip)"
+	mkdir -p "${wrap}"
+	printf '#!/bin/sh\nfor a in "$@"; do if [ "$a" = "-d" ]; then echo extract >> "%s"; fi; done\nexec "%s" "$@"\n' "${log}" "${real}" > "${wrap}/unzip"
+	chmod +x "${wrap}/unzip"
+	mk_docroot once1
+	LABEL="build --manifest"
+	: > "${log}"
+	run_tool_env "PATH=${wrap}:${PATH}" -- my-plugin --manifest
+	assert_rc 0
+	assert_eq "1" "$(wc -l < "${log}" | tr -d ' ')" "build での展開の回数"
+	LABEL="--rebuild --manifest"
+	rm -f "${OUTD}/my-plugin.1.2.3.zip" "${OUTD}/my-plugin.1.2.3.manifest.txt"
+	: > "${log}"
+	run_tool_env "PATH=${wrap}:${PATH}" -- my-plugin --rebuild --manifest
+	assert_rc 0
+	assert_has "内容の指紋が、タグの記録と一致しました"
+	assert_eq "1" "$(wc -l < "${log}" | tr -d ' ')" "--rebuild での展開の回数"
+}
+
 # マニフェストがすでにあるときは、何も作らずに止めること(Zip・タグも). 壊れたシンボリックリンクも「ある」とみなす.
 test_existing_manifest_stops_before_anything_is_made() {
 	need_real_wp || return 0
