@@ -23,5 +23,5 @@
 
 - 版は `bin/wp-release-zip-maker` の `WP_RELEASE_ZIP_MAKER_VERSION`・CHANGELOG・README の `Built-with:` の例に書く。上げるときは、旧版の番号をリポジトリ全体で検索して、漏れが無いか確かめる
 - 作業はブランチで進め、リリースのときに `main` へ `--no-ff` でマージする(`main` は、いつも最新のリリースと同じ状態にする. 利用者は `git pull` で更新するため)
-- タグと GitHub の Release の名前は、素の版番号(`1.1.0`)にする。`v` を付けない
+- タグと GitHub の Release の名前は、素の版番号(`1.2.0`)にする。`v` を付けない
 - GitHub の Release は、更新の通知用(1.1.0 から)。ファイルは付けず、本文は CHANGELOG の該当の節にする
