@@ -337,6 +337,61 @@ plugin ${P}"
 	assert_rc 0
 }
 
+# --- main 以外のブランチから作る(確認 y/n/main. 実物の wp dist-archive で、Zip とタグまで作る) ---------------
+
+# 標準入力に答え($1. printf %b の形)を渡して、端末と見なして実行する(偽の wp は使わない). 以降の引数 = ツールの引数.
+run_tty() {
+	local input="$1"
+	shift
+	OUT="$(printf '%b' "${input}" | env WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 "${TOOL_BASH}" "${TOOL}" "$@" 2>&1)"
+	RC=$?
+}
+
+# y と --yes は、今のブランチ(work)のコミットで、Zip とタグを作る(タグは work の HEAD).
+test_branch_yes_builds_from_the_current_branch() {
+	need_real_wp || return 0
+	mk_docroot br1
+	git switch -q -c work
+	local head
+	head="$(git rev-parse HEAD)"
+	LABEL="y"
+	run_tty 'y\n' my-plugin
+	assert_rc 0
+	assert_has "警告: ブランチは work です"
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "${head}" "$(git rev-parse 'my-plugin/1.2.3^{commit}')" "タグのコミット"
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+	# --yes(標準入力は端末でなくてよい)
+	mk_docroot br2
+	git switch -q -c work
+	LABEL="--yes"
+	run_tool my-plugin --yes
+	assert_rc 0
+	assert_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+}
+
+# main と答える(work は main に入っている): main に切り替わり、main の HEAD(版 1.2.4)で Zip とタグを作る. 元のブランチ名を添える.
+test_branch_main_answer_builds_from_main() {
+	need_real_wp || return 0
+	mk_docroot br3
+	git switch -q -c work
+	git switch -q main
+	bump_plugin 1.2.4
+	git switch -q work
+	local main_head
+	main_head="$(git rev-parse main)"
+	run_tty 'main\n' my-plugin
+	assert_rc 0
+	assert_has "main に切り替えました(HEAD "
+	assert_has "ブランチ:   main に切り替えました(元は work). 戻すなら: git switch work"
+	assert_file "${OUTD}/my-plugin.1.2.4.zip"
+	assert_no_file "${OUTD}/my-plugin.1.2.3.zip"
+	assert_eq "${main_head}" "$(git rev-parse 'my-plugin/1.2.4^{commit}')" "タグのコミット(main の HEAD)"
+	assert_eq "main" "$(git branch --show-current)" "ブランチ(main のまま)"
+	assert_eq "my-plugin/1.2.4" "$(git tag)" "作られたタグ(1 つだけ)"
+}
+
 # --- --json(機械が読めるレポート) ---------------------------------------------------------------
 
 # JSON のファイル($1)から、キー($2. 入れ子は a.b)の値を文字列で出す(null は 'null'). jq があれば jq、無ければ python3 で読む.

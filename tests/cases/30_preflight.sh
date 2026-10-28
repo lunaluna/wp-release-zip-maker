@@ -337,7 +337,7 @@ test_branch_prompt_yes_proceeds() {
 	local a
 	for a in 'y\n' 'yes\n' 'Y\n' 'YES\n'; do
 		LABEL="答え ${a}"; pf_tty "${a}" my-plugin
-		assert_has "このまま work で Zip とタグを作りますか? [y]es / [n]o:"
+		assert_has "このまま work で Zip とタグを作りますか? [y]es / [n]o / main(main に切り替えて作る): "
 		assert_has "${PROCEEDED}"
 	done
 }
@@ -364,10 +364,10 @@ test_branch_prompt_asks_again_on_a_strange_answer() {
 	git switch -q -c work
 	LABEL="変な答えのあと n"; pf_tty 'maybe\nn\n' my-plugin
 	assert_rc 1
-	assert_has "y か n で答えてください"
+	assert_has "y か n か main で答えてください"   # 既定のブランチ(main)があるので、main も選択肢に出る
 	assert_has "やめました"
 	LABEL="変な答えのあと y"; pf_tty 'maybe\ny\n' my-plugin
-	assert_has "y か n で答えてください"
+	assert_has "y か n か main で答えてください"
 	assert_has "${PROCEEDED}"
 }
 
@@ -439,6 +439,99 @@ test_default_branch_is_main_then_master() {
 	git branch -q master
 	LABEL="両方ある → main"; pf my-plugin
 	assert_has "main で作るなら、先に git switch main してください"
+}
+
+# 「main」の答え(既定のブランチへ切り替えて、同じ引数で起動し直す). 切り替えたあとの版は、切り替えたあとの HEAD で読み直す.
+
+# 選択肢の出し方: 既定のブランチがあれば「main(main に切り替えて作る)」を出し、無ければ出さない(master だけなら master).
+test_branch_prompt_options_follow_the_default_branch() {
+	pf_setup mb1
+	git switch -q -c work
+	LABEL="main がある"; pf_tty 'n\n' my-plugin
+	assert_has "[y]es / [n]o / main(main に切り替えて作る): "
+	git branch -q -m main master
+	LABEL="master だけ"; pf_tty 'n\n' my-plugin
+	assert_has "[y]es / [n]o / master(master に切り替えて作る): "
+	git branch -q -m master trunk
+	LABEL="どちらも無い"; pf_tty 'n\n' my-plugin
+	assert_has "このまま work で Zip とタグを作りますか? [y]es / [n]o: "
+	assert_lacks "に切り替えて作る"
+}
+
+# 選択肢に無い「main」は、変な答えと同じ(もう一度聞く). 切り替えない.
+test_branch_prompt_main_is_not_accepted_without_a_default_branch() {
+	pf_setup mb2
+	git switch -q -c work
+	git branch -q -m main trunk
+	pf_tty 'main\nn\n' my-plugin
+	assert_rc 1
+	assert_has "y か n で答えてください."
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+}
+
+# main に入っていないコミットがあれば、切り替えずに止める(ブランチは変わらない. 何も作らない).
+test_branch_prompt_main_stops_when_the_commits_are_not_merged() {
+	pf_setup mb3
+	git switch -q -c work
+	echo more >> "${P}/a-helper.php"
+	gcommit "work only"
+	echo again >> "${P}/a-helper.php"
+	gcommit "work only 2"
+	pf_tty 'main\n' my-plugin
+	assert_rc 1
+	assert_has "work の 2 個のコミットが main に入っていません"
+	assert_has "先に main へマージしてから実行してください. ブランチは変えていません."
+	assert_eq "work" "$(git branch --show-current)" "ブランチ(変わらない)"
+	assert_lacks "に切り替えました"
+	assert_lacks "${PROCEEDED}"
+	assert_no_file "${OUTD}"
+	assert_eq "" "$(git tag)" "作られたタグ"
+	LABEL="detached HEAD"; git checkout -q --detach
+	pf_tty 'main\n' my-plugin
+	assert_rc 1
+	assert_has "(detached HEAD) の 2 個のコミットが main に入っていません"
+}
+
+# main に入っていれば、切り替えて、同じ引数で起動し直し、切り替えたあとの HEAD で版を読み直す(main の版は 1.2.4・work の元の版は 1.2.3).
+# 起動し直したあとは聞かない. 切り替えたブランチは、そのまま残る.
+test_branch_prompt_main_switches_and_restarts_from_main() {
+	pf_setup mb4
+	git switch -q -c work
+	git switch -q main
+	bump_plugin 1.2.4        # main が先に進む(work は 1.2.3 の古いコミット = main に入っている)
+	git switch -q work
+	pf_tty 'main\n' my-plugin
+	assert_has "main に切り替えました(HEAD "
+	assert_has "main で改めて確かめます."
+	assert_has "を作ります: 版 1.2.4・HEAD "           # 切り替えたあとの版(切り替える前に読んだ 1.2.3 を使い回していない)
+	assert_lacks "版 1.2.3"
+	assert_has "${PROCEEDED}"
+	assert_eq 1 "$(printf '%s\n' "${OUT}" | grep -c '警告: ブランチは')" "警告の回数(切り替える前の 1 回だけ. 起動し直したあとは main なので出ない)"
+	assert_eq 1 "$(printf '%s\n' "${OUT}" | grep -c 'このまま work で')" "確認を出した回数(起動し直したあとは出さない)"
+	assert_eq "main" "$(git branch --show-current)" "ブランチ(main に切り替わったまま)"
+	assert_eq "" "$(git tag)" "作られたタグ(偽の wp で止まる)"
+}
+
+# 既定のブランチが master のときは、master と答える.
+test_branch_prompt_master_is_the_default_when_there_is_no_main() {
+	pf_setup mb5
+	git branch -q -m main master
+	git switch -q -c work
+	pf_tty 'master\n' my-plugin
+	assert_has "master に切り替えました(HEAD "
+	assert_has "${PROCEEDED}"
+	assert_eq "master" "$(git branch --show-current)" "ブランチ"
+}
+
+# 起動し直したあとも main / master 以外なら(切り替えが効いていない)、もう一度勧めずに止める. 内部の環境変数を直接渡して確かめる.
+test_branch_prompt_does_not_loop_after_a_restart() {
+	pf_setup mb6
+	git switch -q -c work
+	OUT="$(printf 'y\n' | env "WP_RELEASE_ZIP_MAKER_WP=${FAKE_WP}" WP_RELEASE_ZIP_MAKER_ASSUME_TTY=1 WP_RELEASE_ZIP_MAKER_SWITCHED_FROM=feature "${TOOL_BASH}" "${TOOL}" my-plugin 2>&1)"
+	RC=$?
+	assert_rc 1
+	assert_has "feature から切り替えて起動し直しましたが、まだ work です"
+	assert_lacks "このまま work で"
 }
 
 # --- コミット・コミッター --------------------------------------------------------------------------

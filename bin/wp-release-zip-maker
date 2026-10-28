@@ -698,6 +698,10 @@ ZIP_SCAN_FILE=""
 BUILT_ZIP=""
 # check_rebuild_digest の結果(--json の content_match 用): 1 = 一致 / 0 = 不一致 / 空 = 記録なし・比べられない.
 REBUILD_CONTENT_MATCH=""
+# 起動したときの引数(main の最初に取っておく). 「main」と答えて切り替えたあと、同じ引数でツールを起動し直すのに使う.
+ORIG_ARGS=()
+# 内部用の環境変数: 「main」の答えで切り替えて起動し直したとき、元のブランチ名を新しいプロセスへ渡す(最後の表示と、聞き直しの防止に使う).
+SWITCHED_FROM_VAR="WP_RELEASE_ZIP_MAKER_SWITCHED_FROM"
 # 出力先に作りかけの一時ファイルのパス(publish_zip が作る. 終了時に cleanup_tmp が消す).
 PART_FILE=""
 
@@ -1402,17 +1406,25 @@ default_branch() {
 # 事前の確認がすべて通ったあと・Zip を作る前に呼ぶ(y と答えたあとで別の理由で止まらないように).
 #   $1 = ブランチ名(detached HEAD は '(detached HEAD)') / $2 = 1 なら聞かずに進む(--yes)
 # 状態: --yes → 進む / 端末から答えられない(標準入力が端末でない)→ 止める(終了コード 1) /
-#       y・yes → 進む / n・no・空の Enter・入力の終わり(Ctrl-D)→ やめる(終了コード 1) / それ以外 → もう一度聞く. 大文字小文字は区別しない.
+#       y・yes → 進む / n・no・空の Enter・入力の終わり(Ctrl-D)→ やめる(終了コード 1) /
+#       main(既定のブランチの名前. 既定のブランチがあるときだけ選べる)→ 切り替えて起動し直す(switch_to_default_and_restart) /
+#       それ以外 → もう一度聞く. 大文字小文字は区別しない.
 # 端末が無いときに止めるのは、確認を黙って飛ばすと、スクリプトや CI が誤ったブランチからリリースを作れてしまうため(--yes で明示的に通す).
 confirm_branch() {
-	local branch="$1" yes="$2" def ans
+	local branch="$1" yes="$2" def="" ans options
 	[ "${yes}" -eq 0 ] || return 0
+	def="$(default_branch)" || def=""
 	if ! stdin_is_terminal; then
-		def="$(default_branch)" || def=""
 		die "端末から答えられないので、止めます(${branch} から Zip とタグを作る確認が出せません). 続けるなら --yes を付けてください.${def:+ ${def} で作るなら、先に git switch ${def} してください.}"
 	fi
+	# 起動し直したあとでも main / master 以外なら、切り替えが効いていない. もう一度「main」を勧めると、切り替えを繰り返すので止める.
+	if [ -n "${!SWITCHED_FROM_VAR:-}" ]; then
+		die "${!SWITCHED_FROM_VAR} から切り替えて起動し直しましたが、まだ ${branch} です(切り替えが効いていません). ブランチを確かめてください."
+	fi
+	options="[y]es / [n]o"
+	[ -z "${def}" ] || options="${options} / ${def}(${def} に切り替えて作る)"
 	while :; do
-		printf 'このまま %s で Zip とタグを作りますか? [y]es / [n]o: ' "${branch}" >&2
+		printf 'このまま %s で Zip とタグを作りますか? %s: ' "${branch}" "${options}" >&2
 		# 入力の終わり(Ctrl-D)は、読めなかったこととして「やめる」にする.
 		IFS= read -r ans || ans=""
 		ans="$(printf '%s' "${ans}" | tr '[:upper:]' '[:lower:]')"
@@ -1423,9 +1435,38 @@ confirm_branch() {
 				err "${PROG}: やめました. Zip もタグも作っていません. ブランチは変えていません."
 				exit "${EXIT_STOP}"
 				;;
-			*) err "  y か n で答えてください." ;;
+			*)
+				# 既定のブランチの名前(main か master)が答えなら、切り替える. 既定のブランチが無ければ、選択肢に無いので、ここへ来ない.
+				if [ -n "${def}" ] && [ "${ans}" = "${def}" ]; then
+					switch_to_default_and_restart "${branch}" "${def}"
+				fi
+				err "  y か n${def:+ か ${def}} で答えてください."
+				;;
 		esac
 	done
+}
+
+# 「main」(既定のブランチ)と答えたとき: 今の HEAD が既定のブランチに入っていることを確かめ、切り替え、同じ引数でツールを起動し直す.
+#   $1 = 今のブランチ名 / $2 = 既定のブランチ名
+# 入っていなければ(マージされていなければ)切り替えずに止める(終了コード 1). 切り替えても、そのコミットは Zip に入らず、
+#   気づかないまま、マージ前の変更を含まないリリースを作ってしまうため.
+# 切り替えに失敗したら(未追跡のファイルがぶつかるなど)、Git のエラーを出して止める(ブランチは元のまま).
+# 起動し直す(exec)のは、版・check・タグの有無・Zip の名前を、すべて切り替えたあとの HEAD で確かめ直すため(切り替える前に読んだ値を使い回さない).
+#   起動し直したあとは、既定のブランチにいるので、もう聞かない(無限ループにならない). 元のブランチ名は環境変数で渡し、最後の表示に使う.
+switch_to_default_and_restart() {
+	local from="$1" def="$2" n out
+	if ! git -C "${GIT_TOP}" merge-base --is-ancestor HEAD "${def}" 2>/dev/null; then
+		n="$(git -C "${GIT_TOP}" rev-list --count "${def}..HEAD" 2>/dev/null)" || n="?"
+		die "${from} の ${n} 個のコミットが ${def} に入っていません. 切り替えても、それらは Zip に入りません. 先に ${def} へマージしてから実行してください. ブランチは変えていません."
+	fi
+	if ! out="$(git -C "${GIT_TOP}" switch "${def}" 2>&1)"; then
+		err "${out}"
+		die "${def} へ切り替えられませんでした(Git のエラーは上のとおり). ブランチは変えていません."
+	fi
+	err "${def} に切り替えました(HEAD $(git -C "${GIT_TOP}" rev-parse --short HEAD)). ${def} で改めて確かめます."
+	export "${SWITCHED_FROM_VAR}=${from}"
+	# ORIG_ARGS は、スラッグがあるので空にならない(bash 3.2 は、空の配列を set -u の下で展開すると落ちる).
+	exec "${BASH}" "$0" "${ORIG_ARGS[@]}"
 }
 
 # 3 つの動作の事前の確認と実行.
@@ -1582,7 +1623,7 @@ cmd_build() {
 			main | master) ;;
 			*)
 				if [ "${dry}" -eq 1 ]; then
-					err "  [dry-run] 本番の実行では、このまま作るかを聞きます(端末から答えられなければ止まります. --yes で飛ばせます)."
+					err "  [dry-run] 本番の実行では、このまま作るかを聞きます(y/n$(default_branch | sed 's#^#/#'). 端末から答えられなければ止まります. --yes で飛ばせます)."
 				else
 					confirm_branch "${branch}" "${yes}"
 				fi
@@ -1649,6 +1690,8 @@ cmd_build() {
 	print_zip_summary "${slug}" "${zip_file}"
 	printf '\nタグ:       %s を打ちました(注釈付き%s・コミット %s).\n' "${tag}" "$([ "${sign}" -eq 0 ] || printf '・署名付き')" "${short}"
 	printf '            push はしていません. 共有するなら: git push <リモート名> %s\n' "${tag}"
+	# 「main」と答えて切り替えたときは、ブランチが元と違うことを、最後に添える(元のブランチには戻さない).
+	[ -z "${!SWITCHED_FROM_VAR:-}" ] || printf 'ブランチ:   %s に切り替えました(元は %s). 戻すなら: git switch %s\n' "${branch}" "${!SWITCHED_FROM_VAR}" "${!SWITCHED_FROM_VAR}"
 	finish_json_report "${json_file}" "${slug}" "${kind}" "${ver}" build "${tag}" "${ref}" "$([ "${branch}" = "(detached HEAD)" ] || printf '%s' "${branch}")" "${zip_file}" "$([ "${manifest}" -eq 1 ] && printf '%s' "${manifest_file}")" "${sign}" ""
 	print_deploy_hint "${kind}" "${slug}" "${ver}" "${tag}" "${zip_file}"
 	end_json_report
@@ -1873,6 +1916,8 @@ print_deploy_hint() {
 # --- 入口 ---------------------------------------------------------------------------------------
 
 main() {
+	# 起動したときの引数を取っておく(「main」と答えて切り替えたあと、同じ引数で起動し直すため).
+	ORIG_ARGS=("$@")
 	# 引数なしは使い方の誤り. 説明を標準エラーに出して終了する.
 	if [ "$#" -eq 0 ]; then
 		usage >&2
