@@ -1333,11 +1333,14 @@ tree_path_of() {
 }
 
 # ref の時点に、設定ファイルからの相対パス $2 のファイル(またはディレクトリ)があるか. $1 = ref.
+# 使い道は、設定ファイルからの相対パスで読むもの(.distignore・check の対象のファイル)だけ.
+# 版の読み取りには使わない: 版は read_version_in と src_*(作業ツリーと ref の違いを閉じ込めた入口)の 1 か所で読む(2026-10-28 のレビュー 4 への回答).
 blob_exists() {
 	git -C "${GIT_TOP}" cat-file -e "${1}:${PREFIX}${2}" 2>/dev/null
 }
 
 # ref の時点の、設定ファイルからの相対パス $2 のファイルの中身を標準出力へ出す. $1 = ref.
+# blob_exists と同じく、.distignore・check の対象のファイルを読むためのもの. 版の読み取りには使わない(read_version_in と src_* を使う).
 blob_cat() {
 	git -C "${GIT_TOP}" show "${1}:${PREFIX}${2}" 2>/dev/null
 }
